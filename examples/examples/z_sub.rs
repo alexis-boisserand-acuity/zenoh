@@ -12,37 +12,41 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::Parser;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+use zenoh::{key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
 
 #[tokio::main]
 async fn main() {
     // Initiate logging
-    zenoh_util::try_init_log_from_env();
+    zenoh::init_log_from_env_or("error");
 
-    let (mut config, key_expr) = parse_args();
-
-    // A probing procedure for shared memory is performed upon session opening. To enable `z_pub_shm` to operate
-    // over shared memory (and to not fallback on network mode), shared memory needs to be enabled also on the
-    // subscriber side. By doing so, the probing procedure will succeed and shared memory will operate as expected.
-    config.transport.shared_memory.set_enabled(true).unwrap();
+    let (config, key_expr) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Declaring Subscriber on '{}'...", &key_expr);
-
-    let subscriber = session.declare_subscriber(&key_expr).res().await.unwrap();
+    let subscriber = session.declare_subscriber(&key_expr).await.unwrap();
 
     println!("Press CTRL-C to quit...");
     while let Ok(sample) = subscriber.recv_async().await {
-        println!(
+        // Refer to z_bytes.rs to see how to deserialize different types of message
+        let payload = sample
+            .payload()
+            .try_to_string()
+            .unwrap_or_else(|e| e.to_string().into());
+
+        print!(
             ">> [Subscriber] Received {} ('{}': '{}')",
-            sample.kind,
-            sample.key_expr.as_str(),
-            sample.value
+            sample.kind(),
+            sample.key_expr().as_str(),
+            payload
         );
+        if let Some(att) = sample.attachment() {
+            let att = att.try_to_string().unwrap_or_else(|e| e.to_string().into());
+            print!(" ({})", att);
+        }
+        println!();
     }
 }
 

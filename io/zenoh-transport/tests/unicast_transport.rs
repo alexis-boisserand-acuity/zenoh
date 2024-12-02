@@ -11,21 +11,23 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::fmt::Write as _;
 use std::{
     any::Any,
     convert::TryFrom,
+    fmt::Write as _,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
 };
+
 use zenoh_core::ztimeout;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::{
-        Channel, CongestionControl, Encoding, EndPoint, Priority, Reliability, WhatAmI, ZenohId,
+        Channel, CongestionControl, Encoding, EndPoint, Priority, Reliability, WhatAmI,
+        ZenohIdProto,
     },
     network::{
         push::ext::{NodeIdType, QoSType},
@@ -230,13 +232,13 @@ const SLEEP_COUNT: Duration = Duration::from_millis(10);
 
 const MSG_COUNT: usize = 1_000;
 const MSG_SIZE_ALL: [usize; 2] = [1_024, 131_072];
-const MSG_SIZE_LOWLATENCY: [usize; 2] = [1_024, 65000];
 #[cfg(any(
     feature = "transport_tcp",
     feature = "transport_udp",
     feature = "transport_unixsock-stream",
 ))]
 const MSG_SIZE_NOFRAG: [usize; 1] = [1_024];
+const MSG_SIZE_LOWLATENCY: [usize; 1] = MSG_SIZE_NOFRAG;
 
 // Transport Handler for the router
 struct SHRouter {
@@ -294,7 +296,6 @@ impl TransportPeerEventHandler for SCRouter {
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {
@@ -334,7 +335,6 @@ impl TransportPeerEventHandler for SCClient {
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {
@@ -353,8 +353,8 @@ async fn open_transport_unicast(
     TransportUnicast,
 ) {
     // Define client and router IDs
-    let client_id = ZenohId::try_from([1]).unwrap();
-    let router_id = ZenohId::try_from([2]).unwrap();
+    let client_id = ZenohIdProto::try_from([1]).unwrap();
+    let router_id = ZenohIdProto::try_from([2]).unwrap();
 
     // Create the router transport manager
     let router_handler = Arc::new(SHRouter::default());
@@ -400,10 +400,7 @@ async fn open_transport_unicast(
         let _ = ztimeout!(client_manager.open_transport_unicast(e.clone())).unwrap();
     }
 
-    let client_transport = client_manager
-        .get_transport_unicast(&router_id)
-        .await
-        .unwrap();
+    let client_transport = ztimeout!(client_manager.get_transport_unicast(&router_id)).unwrap();
 
     // Return the handlers
     (
@@ -470,16 +467,17 @@ async fn test_transport(
         Reliability::Reliable => CongestionControl::Block,
         Reliability::BestEffort => CongestionControl::Drop,
     };
+
     // Create the message to send
     let message: NetworkMessage = Push {
         wire_expr: "test".into(),
         ext_qos: QoSType::new(channel.priority, cctrl, false),
         ext_tstamp: None,
-        ext_nodeid: NodeIdType::default(),
+        ext_nodeid: NodeIdType::DEFAULT,
         payload: Put {
             payload: vec![0u8; msg_size].into(),
             timestamp: None,
-            encoding: Encoding::default(),
+            encoding: Encoding::empty(),
             ext_sinfo: None,
             #[cfg(feature = "shared-memory")]
             ext_shm: None,
@@ -543,9 +541,7 @@ async fn run_single(
     {
         let c_stats = client_transport.get_stats().unwrap().report();
         println!("\tClient: {:?}", c_stats);
-        let r_stats = router_manager
-            .get_transport_unicast(&client_manager.config.zid)
-            .await
+        let r_stats = ztimeout!(router_manager.get_transport_unicast(&client_manager.config.zid))
             .unwrap()
             .get_stats()
             .map(|s| s.report())
@@ -608,7 +604,7 @@ async fn run_with_lowlatency_transport(
 #[cfg(feature = "transport_tcp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_tcp_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![
@@ -618,7 +614,7 @@ async fn transport_unicast_tcp_only() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
@@ -633,14 +629,14 @@ async fn transport_unicast_tcp_only() {
 #[cfg(feature = "transport_tcp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_tcp_only_with_lowlatency_transport() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![format!("tcp/127.0.0.1:{}", 16100).parse().unwrap()];
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
@@ -655,7 +651,7 @@ async fn transport_unicast_tcp_only_with_lowlatency_transport() {
 #[cfg(feature = "transport_udp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_udp_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
@@ -665,7 +661,7 @@ async fn transport_unicast_udp_only() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -680,14 +676,14 @@ async fn transport_unicast_udp_only() {
 #[cfg(feature = "transport_udp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_udp_only_with_lowlatency_transport() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![format!("udp/127.0.0.1:{}", 16110).parse().unwrap()];
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -702,7 +698,7 @@ async fn transport_unicast_udp_only_with_lowlatency_transport() {
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_unix_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let f1 = "zenoh-test-unix-socket-5.sock";
     let _ = std::fs::remove_file(f1);
@@ -711,7 +707,7 @@ async fn transport_unicast_unix_only() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -728,7 +724,7 @@ async fn transport_unicast_unix_only() {
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_unix_only_with_lowlatency_transport() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let f1 = "zenoh-test-unix-socket-5-lowlatency.sock";
     let _ = std::fs::remove_file(f1);
@@ -737,7 +733,7 @@ async fn transport_unicast_unix_only_with_lowlatency_transport() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -754,7 +750,7 @@ async fn transport_unicast_unix_only_with_lowlatency_transport() {
 #[cfg(feature = "transport_ws")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_ws_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![
@@ -764,11 +760,11 @@ async fn transport_unicast_ws_only() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -787,18 +783,18 @@ async fn transport_unicast_ws_only() {
 #[cfg(feature = "transport_ws")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_ws_only_with_lowlatency_transport() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![format!("ws/127.0.0.1:{}", 16120).parse().unwrap()];
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -817,7 +813,7 @@ async fn transport_unicast_ws_only_with_lowlatency_transport() {
 #[cfg(feature = "transport_unixpipe")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_unixpipe_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
@@ -827,7 +823,7 @@ async fn transport_unicast_unixpipe_only() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
@@ -842,7 +838,7 @@ async fn transport_unicast_unixpipe_only() {
 #[cfg(feature = "transport_unixpipe")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_unixpipe_only_with_lowlatency_transport() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
@@ -853,7 +849,7 @@ async fn transport_unicast_unixpipe_only_with_lowlatency_transport() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
@@ -868,7 +864,7 @@ async fn transport_unicast_unixpipe_only_with_lowlatency_transport() {
 #[cfg(all(feature = "transport_tcp", feature = "transport_udp"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_tcp_udp() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
@@ -880,7 +876,7 @@ async fn transport_unicast_tcp_udp() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -899,7 +895,7 @@ async fn transport_unicast_tcp_udp() {
 ))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_tcp_unix() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let f1 = "zenoh-test-unix-socket-6.sock";
     let _ = std::fs::remove_file(f1);
@@ -912,7 +908,7 @@ async fn transport_unicast_tcp_unix() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -933,7 +929,7 @@ async fn transport_unicast_tcp_unix() {
 ))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_udp_unix() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let f1 = "zenoh-test-unix-socket-7.sock";
     let _ = std::fs::remove_file(f1);
@@ -946,7 +942,7 @@ async fn transport_unicast_udp_unix() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -968,7 +964,7 @@ async fn transport_unicast_udp_unix() {
 ))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_tcp_udp_unix() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let f1 = "zenoh-test-unix-socket-8.sock";
     let _ = std::fs::remove_file(f1);
@@ -983,7 +979,7 @@ async fn transport_unicast_tcp_udp_unix() {
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -1002,31 +998,31 @@ async fn transport_unicast_tcp_udp_unix() {
 async fn transport_unicast_tls_only_server() {
     use zenoh_link::tls::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let mut endpoint: EndPoint = format!("tls/localhost:{}", 16070).parse().unwrap();
     endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
 
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -1048,30 +1044,30 @@ async fn transport_unicast_tls_only_server() {
 async fn transport_unicast_quic_only_server() {
     use zenoh_link::quic::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
     // Define the locator
     let mut endpoint: EndPoint = format!("quic/localhost:{}", 16080).parse().unwrap();
     endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
 
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -1093,7 +1089,7 @@ async fn transport_unicast_quic_only_server() {
 async fn transport_unicast_tls_only_mutual_success() {
     use zenoh_link::tls::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let client_auth = "true";
 
@@ -1101,15 +1097,15 @@ async fn transport_unicast_tls_only_mutual_success() {
     let mut client_endpoint: EndPoint = ("tls/localhost:10461").parse().unwrap();
     client_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
-                (TLS_CLIENT_CERTIFICATE_RAW, CLIENT_CERT),
-                (TLS_CLIENT_PRIVATE_KEY_RAW, CLIENT_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_CONNECT_CERTIFICATE_RAW, CLIENT_CERT),
+                (TLS_CONNECT_PRIVATE_KEY_RAW, CLIENT_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
 
@@ -1117,25 +1113,25 @@ async fn transport_unicast_tls_only_mutual_success() {
     let mut server_endpoint: EndPoint = ("tls/localhost:10461").parse().unwrap();
     server_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -1163,44 +1159,41 @@ async fn transport_unicast_tls_only_mutual_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_tls_only_mutual_no_client_certs_failure() {
     use std::vec;
+
     use zenoh_link::tls::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let mut client_endpoint: EndPoint = ("tls/localhost:10462").parse().unwrap();
     client_endpoint
         .config_mut()
-        .extend(
-            [(TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA)]
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-        )
+        .extend_from_iter([(TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA)].iter().copied())
         .unwrap();
 
     // Define the locator
     let mut server_endpoint: EndPoint = ("tls/localhost:10462").parse().unwrap();
     server_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, "true"),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, "true"),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -1233,7 +1226,7 @@ async fn transport_unicast_tls_only_mutual_no_client_certs_failure() {
 fn transport_unicast_tls_only_mutual_wrong_client_certs_failure() {
     use zenoh_link::tls::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let client_auth = "true";
 
@@ -1241,19 +1234,19 @@ fn transport_unicast_tls_only_mutual_wrong_client_certs_failure() {
     let mut client_endpoint: EndPoint = ("tls/localhost:10463").parse().unwrap();
     client_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
                 // Using the SERVER_CERT and SERVER_KEY in the client to simulate the case the client has
                 // wrong certificates and keys. The SERVER_CA (cetificate authority) will not recognize
                 // these certificates as it is expecting to receive CLIENT_CERT and CLIENT_KEY from the
                 // client.
-                (TLS_CLIENT_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_CLIENT_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_CONNECT_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_CONNECT_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
 
@@ -1261,25 +1254,25 @@ fn transport_unicast_tls_only_mutual_wrong_client_certs_failure() {
     let mut server_endpoint: EndPoint = ("tls/localhost:10463").parse().unwrap();
     server_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
     // Define the reliability and congestion control
     let channel = [
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::Reliable,
         },
         Channel {
-            priority: Priority::default(),
+            priority: Priority::DEFAULT,
             reliability: Reliability::BestEffort,
         },
         Channel {
@@ -1312,7 +1305,7 @@ fn transport_unicast_tls_only_mutual_wrong_client_certs_failure() {
 async fn transport_unicast_quic_only_mutual_success() {
     use zenoh_link::quic::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let client_auth = "true";
 
@@ -1320,15 +1313,15 @@ async fn transport_unicast_quic_only_mutual_success() {
     let mut client_endpoint: EndPoint = ("quic/localhost:10461").parse().unwrap();
     client_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
-                (TLS_CLIENT_CERTIFICATE_RAW, CLIENT_CERT),
-                (TLS_CLIENT_PRIVATE_KEY_RAW, CLIENT_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_CONNECT_CERTIFICATE_RAW, CLIENT_CERT),
+                (TLS_CONNECT_PRIVATE_KEY_RAW, CLIENT_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
 
@@ -1336,15 +1329,15 @@ async fn transport_unicast_quic_only_mutual_success() {
     let mut server_endpoint: EndPoint = ("quic/localhost:10461").parse().unwrap();
     server_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
     // Define the reliability and congestion control
@@ -1382,34 +1375,31 @@ async fn transport_unicast_quic_only_mutual_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transport_unicast_quic_only_mutual_no_client_certs_failure() {
     use std::vec;
+
     use zenoh_link::quic::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     // Define the locator
     let mut client_endpoint: EndPoint = ("quic/localhost:10462").parse().unwrap();
     client_endpoint
         .config_mut()
-        .extend(
-            [(TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA)]
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-        )
+        .extend_from_iter([(TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA)].iter().copied())
         .unwrap();
 
     // Define the locator
     let mut server_endpoint: EndPoint = ("quic/localhost:10462").parse().unwrap();
     server_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, "true"),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, "true"),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
     // Define the reliability and congestion control
@@ -1452,7 +1442,7 @@ async fn transport_unicast_quic_only_mutual_no_client_certs_failure() {
 fn transport_unicast_quic_only_mutual_wrong_client_certs_failure() {
     use zenoh_link::quic::config::*;
 
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
 
     let client_auth = "true";
 
@@ -1460,19 +1450,19 @@ fn transport_unicast_quic_only_mutual_wrong_client_certs_failure() {
     let mut client_endpoint: EndPoint = ("quic/localhost:10463").parse().unwrap();
     client_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
                 // Using the SERVER_CERT and SERVER_KEY in the client to simulate the case the client has
                 // wrong certificates and keys. The SERVER_CA (cetificate authority) will not recognize
                 // these certificates as it is expecting to receive CLIENT_CERT and CLIENT_KEY from the
                 // client.
-                (TLS_CLIENT_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_CLIENT_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_CONNECT_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_CONNECT_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
 
@@ -1480,15 +1470,15 @@ fn transport_unicast_quic_only_mutual_wrong_client_certs_failure() {
     let mut server_endpoint: EndPoint = ("quic/localhost:10463").parse().unwrap();
     server_endpoint
         .config_mut()
-        .extend(
+        .extend_from_iter(
             [
                 (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
-                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
-                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
-                (TLS_CLIENT_AUTH, client_auth),
+                (TLS_LISTEN_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_ENABLE_MTLS, client_auth),
             ]
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            .copied(),
         )
         .unwrap();
     // Define the reliability and congestion control

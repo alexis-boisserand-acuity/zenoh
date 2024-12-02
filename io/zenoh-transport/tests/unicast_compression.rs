@@ -13,21 +13,23 @@
 //
 #[cfg(feature = "transport_compression")]
 mod tests {
-    use std::fmt::Write as _;
     use std::{
         any::Any,
         convert::TryFrom,
+        fmt::Write as _,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
         time::Duration,
     };
+
     use zenoh_core::ztimeout;
     use zenoh_link::Link;
     use zenoh_protocol::{
         core::{
-            Channel, CongestionControl, Encoding, EndPoint, Priority, Reliability, WhatAmI, ZenohId,
+            Channel, CongestionControl, Encoding, EndPoint, Priority, Reliability, WhatAmI,
+            ZenohIdProto,
         },
         network::{
             push::ext::{NodeIdType, QoSType},
@@ -49,8 +51,8 @@ mod tests {
 
     const MSG_COUNT: usize = 1_000;
     const MSG_SIZE_ALL: [usize; 2] = [1_024, 131_072];
-    const MSG_SIZE_LOWLATENCY: [usize; 2] = [1_024, 65000];
     const MSG_SIZE_NOFRAG: [usize; 1] = [1_024];
+    const MSG_SIZE_LOWLATENCY: [usize; 1] = MSG_SIZE_NOFRAG;
 
     // Transport Handler for the router
     struct SHRouter {
@@ -108,7 +110,6 @@ mod tests {
 
         fn new_link(&self, _link: Link) {}
         fn del_link(&self, _link: Link) {}
-        fn closing(&self) {}
         fn closed(&self) {}
 
         fn as_any(&self) -> &dyn Any {
@@ -148,7 +149,6 @@ mod tests {
 
         fn new_link(&self, _link: Link) {}
         fn del_link(&self, _link: Link) {}
-        fn closing(&self) {}
         fn closed(&self) {}
 
         fn as_any(&self) -> &dyn Any {
@@ -167,8 +167,8 @@ mod tests {
         TransportUnicast,
     ) {
         // Define client and router IDs
-        let client_id = ZenohId::try_from([1]).unwrap();
-        let router_id = ZenohId::try_from([2]).unwrap();
+        let client_id = ZenohIdProto::try_from([1]).unwrap();
+        let router_id = ZenohIdProto::try_from([2]).unwrap();
 
         // Create the router transport manager
         let router_handler = Arc::new(SHRouter::default());
@@ -216,10 +216,7 @@ mod tests {
             let _ = ztimeout!(client_manager.open_transport_unicast(e.clone())).unwrap();
         }
 
-        let client_transport = client_manager
-            .get_transport_unicast(&router_id)
-            .await
-            .unwrap();
+        let client_transport = ztimeout!(client_manager.get_transport_unicast(&router_id)).unwrap();
 
         // Return the handlers
         (
@@ -291,11 +288,11 @@ mod tests {
             wire_expr: "test".into(),
             ext_qos: QoSType::new(channel.priority, cctrl, false),
             ext_tstamp: None,
-            ext_nodeid: NodeIdType::default(),
+            ext_nodeid: NodeIdType::DEFAULT,
             payload: Put {
                 payload: vec![0u8; msg_size].into(),
                 timestamp: None,
-                encoding: Encoding::default(),
+                encoding: Encoding::empty(),
                 ext_sinfo: None,
                 #[cfg(feature = "shared-memory")]
                 ext_shm: None,
@@ -358,13 +355,12 @@ mod tests {
         {
             let c_stats = client_transport.get_stats().unwrap().report();
             println!("\tClient: {:?}", c_stats);
-            let r_stats = router_manager
-                .get_transport_unicast(&client_manager.config.zid)
-                .await
-                .unwrap()
-                .get_stats()
-                .map(|s| s.report())
-                .unwrap();
+            let r_stats =
+                ztimeout!(router_manager.get_transport_unicast(&client_manager.config.zid))
+                    .unwrap()
+                    .get_stats()
+                    .map(|s| s.report())
+                    .unwrap();
             println!("\tRouter: {:?}", r_stats);
         }
 
@@ -423,7 +419,7 @@ mod tests {
     #[cfg(feature = "transport_tcp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transport_unicast_compression_tcp_only() {
-        zenoh_util::try_init_log_from_env();
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locators
         let endpoints: Vec<EndPoint> = vec![
@@ -433,7 +429,7 @@ mod tests {
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::Reliable,
             },
             Channel {
@@ -448,14 +444,14 @@ mod tests {
     #[cfg(feature = "transport_tcp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transport_unicast_compression_tcp_only_with_lowlatency_transport() {
-        zenoh_util::try_init_log_from_env();
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locators
         let endpoints: Vec<EndPoint> = vec![format!("tcp/127.0.0.1:{}", 19100).parse().unwrap()];
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::Reliable,
             },
             Channel {
@@ -470,7 +466,7 @@ mod tests {
     #[cfg(feature = "transport_udp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transport_unicast_compression_udp_only() {
-        zenoh_util::try_init_log_from_env();
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locator
         let endpoints: Vec<EndPoint> = vec![
@@ -480,7 +476,7 @@ mod tests {
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::BestEffort,
             },
             Channel {
@@ -495,14 +491,14 @@ mod tests {
     #[cfg(feature = "transport_udp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transport_unicast_compression_udp_only_with_lowlatency_transport() {
-        zenoh_util::try_init_log_from_env();
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locator
         let endpoints: Vec<EndPoint> = vec![format!("udp/127.0.0.1:{}", 19110).parse().unwrap()];
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::BestEffort,
             },
             Channel {

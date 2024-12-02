@@ -18,6 +18,7 @@ use alloc::{
     string::{String, ToString},
 };
 use core::{convert::TryInto, fmt, sync::atomic::AtomicU16};
+
 use zenoh_keyexpr::{keyexpr, OwnedKeyExpr};
 use zenoh_result::{bail, ZResult};
 
@@ -55,7 +56,7 @@ pub const EMPTY_EXPR_ID: ExprId = 0;
 // ~    suffix     ~ if flag K==1 in Message's header
 // +---------------+
 //
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct WireExpr<'a> {
     pub scope: ExprId, // 0 marks global scope
     pub suffix: Cow<'a, str>,
@@ -69,6 +70,10 @@ impl<'a> WireExpr<'a> {
             suffix: "".into(),
             mapping: Mapping::Sender,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scope == 0 && self.suffix.as_ref().is_empty()
     }
 
     pub fn as_str(&'a self) -> &'a str {
@@ -173,16 +178,6 @@ impl<'a> From<&'a keyexpr> for WireExpr<'a> {
     }
 }
 
-impl fmt::Debug for WireExpr<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if self.scope == 0 {
-            write!(f, "{}", self.suffix)
-        } else {
-            write!(f, "{}:{:?}:{}", self.scope, self.mapping, self.suffix)
-        }
-    }
-}
-
 impl fmt::Display for WireExpr<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.scope == 0 {
@@ -257,7 +252,7 @@ impl WireExpr<'_> {
         WireExpr {
             scope,
             suffix: suffix.into(),
-            mapping: Mapping::default(),
+            mapping: Mapping::DEFAULT,
         }
     }
 }

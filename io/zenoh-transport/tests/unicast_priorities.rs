@@ -11,23 +11,27 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::any::Any;
-use std::convert::TryFrom;
-use std::fmt::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    any::Any,
+    convert::TryFrom,
+    fmt::Write as _,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
 use zenoh_core::ztimeout;
 use zenoh_link::Link;
-use zenoh_protocol::network::NetworkBody;
 use zenoh_protocol::{
-    core::{CongestionControl, Encoding, EndPoint, Priority, WhatAmI, ZenohId},
+    core::{CongestionControl, Encoding, EndPoint, Priority, WhatAmI, ZenohIdProto},
     network::{
         push::{
             ext::{NodeIdType, QoSType},
             Push,
         },
-        NetworkMessage,
+        NetworkBody, NetworkMessage,
     },
     zenoh::Put,
 };
@@ -129,7 +133,6 @@ impl TransportPeerEventHandler for SCRouter {
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {
@@ -179,7 +182,6 @@ impl TransportPeerEventHandler for SCClient {
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {
@@ -196,8 +198,8 @@ async fn open_transport_unicast(
     TransportUnicast,
 ) {
     // Define client and router IDs
-    let client_id = ZenohId::try_from([1]).unwrap();
-    let router_id = ZenohId::try_from([2]).unwrap();
+    let client_id = ZenohIdProto::try_from([1]).unwrap();
+    let router_id = ZenohIdProto::try_from([2]).unwrap();
 
     // Create the router transport manager
     let router_handler = Arc::new(SHRouter::new());
@@ -227,10 +229,7 @@ async fn open_transport_unicast(
         let _ = ztimeout!(client_manager.open_transport_unicast(e.clone())).unwrap();
     }
 
-    let client_transport = client_manager
-        .get_transport_unicast(&router_id)
-        .await
-        .unwrap();
+    let client_transport = ztimeout!(client_manager.get_transport_unicast(&router_id)).unwrap();
 
     // Return the handlers
     (
@@ -289,11 +288,11 @@ async fn single_run(router_handler: Arc<SHRouter>, client_transport: TransportUn
                 wire_expr: "test".into(),
                 ext_qos: QoSType::new(*p, CongestionControl::Block, false),
                 ext_tstamp: None,
-                ext_nodeid: NodeIdType::default(),
+                ext_nodeid: NodeIdType::DEFAULT,
                 payload: Put {
                     payload: vec![0u8; *ms].into(),
                     timestamp: None,
-                    encoding: Encoding::default(),
+                    encoding: Encoding::empty(),
                     ext_sinfo: None,
                     #[cfg(feature = "shared-memory")]
                     ext_shm: None,
@@ -332,7 +331,7 @@ async fn run(endpoints: &[EndPoint]) {
 #[cfg(feature = "transport_tcp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn priorities_tcp_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![format!("tcp/127.0.0.1:{}", 10000).parse().unwrap()];
     // Run
@@ -343,7 +342,7 @@ async fn priorities_tcp_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn conduits_unixpipe_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
     // Define the locators
     let endpoints: Vec<EndPoint> = vec!["unixpipe/conduits_unixpipe_only"
         .to_string()
@@ -356,7 +355,7 @@ async fn conduits_unixpipe_only() {
 #[cfg(feature = "transport_ws")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn priorities_ws_only() {
-    zenoh_util::try_init_log_from_env();
+    zenoh_util::init_log_from_env_or("error");
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![format!("ws/127.0.0.1:{}", 10010).parse().unwrap()];
     // Run

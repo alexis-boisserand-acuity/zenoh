@@ -11,31 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use core::ptr;
-
-pub(crate) struct Writer {
-    pub ptr: *mut u8,
-    pub len: usize,
-}
-
-impl Writer {
-    pub(crate) fn write(&mut self, slice: &[u8]) {
-        let len = slice.len();
-        unsafe { ptr::copy(slice.as_ptr(), self.ptr.add(self.len), len) };
-        self.len += len
-    }
-    pub(crate) fn write_byte(&mut self, byte: u8) {
-        unsafe { *self.ptr.add(self.len) = byte };
-        self.len += 1
-    }
-}
-
 #[derive(Debug)]
 pub struct Splitter<'a, S: ?Sized, D: ?Sized> {
     s: Option<&'a S>,
     d: &'a D,
 }
-impl<'a, S: ?Sized, D: ?Sized> Clone for Splitter<'a, S, D> {
+impl<S: ?Sized, D: ?Sized> Clone for Splitter<'_, S, D> {
     fn clone(&self) -> Self {
         Self {
             s: self.s,
@@ -103,7 +84,7 @@ impl<'a, S: Split<D> + ?Sized, D: ?Sized> Iterator for Splitter<'a, S, D> {
     }
 }
 
-impl<'a, S: Split<D> + ?Sized, D: ?Sized> DoubleEndedIterator for Splitter<'a, S, D> {
+impl<S: Split<D> + ?Sized, D: ?Sized> DoubleEndedIterator for Splitter<'_, S, D> {
     fn next_back(&mut self) -> Option<Self::Item> {
         match self.s {
             Some(s) => {

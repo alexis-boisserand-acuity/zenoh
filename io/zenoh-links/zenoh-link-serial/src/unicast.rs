@@ -12,34 +12,40 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use async_trait::async_trait;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    cell::UnsafeCell,
+    collections::HashMap,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
-use tokio::task::JoinHandle;
+
+use async_trait::async_trait;
+use tokio::{
+    sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
+use z_serial::ZSerial;
 use zenoh_core::{zasynclock, zasyncread, zasyncwrite};
 use zenoh_link_commons::{
-    ConstructibleLinkManagerUnicast, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait,
-    NewLinkChannelSender,
+    ConstructibleLinkManagerUnicast, LinkAuthId, LinkManagerUnicastTrait, LinkUnicast,
+    LinkUnicastTrait, NewLinkChannelSender,
 };
-use zenoh_protocol::core::{EndPoint, Locator};
+use zenoh_protocol::{
+    core::{EndPoint, Locator},
+    transport::BatchSize,
+};
 use zenoh_result::{zerror, ZResult};
-
-use z_serial::ZSerial;
-
-use crate::get_exclusive;
 
 use super::{
     get_baud_rate, get_unix_path_as_string, SERIAL_ACCEPT_THROTTLE_TIME, SERIAL_DEFAULT_MTU,
     SERIAL_LOCATOR_PREFIX,
 };
+use crate::get_exclusive;
 
 struct LinkUnicastSerial {
     // The underlying serial port as returned by ZSerial (tokio-serial)
@@ -177,7 +183,7 @@ impl LinkUnicastTrait for LinkUnicastSerial {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
+    fn get_mtu(&self) -> BatchSize {
         *SERIAL_DEFAULT_MTU
     }
 
@@ -199,12 +205,17 @@ impl LinkUnicastTrait for LinkUnicastSerial {
 
     #[inline(always)]
     fn is_reliable(&self) -> bool {
-        false
+        super::IS_RELIABLE
     }
 
     #[inline(always)]
     fn is_streamed(&self) -> bool {
         false
+    }
+
+    #[inline(always)]
+    fn get_auth_id(&self) -> &LinkAuthId {
+        &LinkAuthId::NONE
     }
 }
 
@@ -321,19 +332,20 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastSerial {
 
         // Spawn the accept loop for the listener
         let token = CancellationToken::new();
-        let c_token = token.clone();
         let mut listeners = zasyncwrite!(self.listeners);
 
-        let c_path = path.clone();
-        let c_manager = self.manager.clone();
-        let c_listeners = self.listeners.clone();
+        let task = {
+            let token = token.clone();
+            let path = path.clone();
+            let manager = self.manager.clone();
+            let listeners = self.listeners.clone();
 
-        let task = async move {
-            // Wait for the accept loop to terminate
-            let res =
-                accept_read_task(link, c_token, c_manager, c_path.clone(), is_connected).await;
-            zasyncwrite!(c_listeners).remove(&c_path);
-            res
+            async move {
+                // Wait for the accept loop to terminate
+                let res = accept_read_task(link, token, manager, path.clone(), is_connected).await;
+                zasyncwrite!(listeners).remove(&path);
+                res
+            }
         };
         let handle = zenoh_runtime::ZRuntime::Acceptor.spawn(task);
 

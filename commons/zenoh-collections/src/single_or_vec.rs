@@ -13,15 +13,14 @@
 //
 
 use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::{
     cmp::PartialEq,
     fmt, iter,
     ops::{Index, IndexMut, RangeBounds},
     ptr, slice,
 };
-
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
 
 #[derive(Clone, Eq)]
 enum SingleOrVecInner<T> {
@@ -30,6 +29,10 @@ enum SingleOrVecInner<T> {
 }
 
 impl<T> SingleOrVecInner<T> {
+    const fn empty() -> Self {
+        SingleOrVecInner::Vec(Vec::new())
+    }
+
     fn push(&mut self, value: T) {
         match self {
             SingleOrVecInner::Vec(vec) if vec.capacity() == 0 => *self = Self::Single(value),
@@ -53,7 +56,7 @@ where
 
 impl<T> Default for SingleOrVecInner<T> {
     fn default() -> Self {
-        SingleOrVecInner::Vec(Vec::new())
+        Self::empty()
     }
 }
 
@@ -88,6 +91,10 @@ where
 pub struct SingleOrVec<T>(SingleOrVecInner<T>);
 
 impl<T> SingleOrVec<T> {
+    pub const fn empty() -> Self {
+        Self(SingleOrVecInner::empty())
+    }
+
     pub fn push(&mut self, value: T) {
         self.0.push(value);
     }
@@ -174,15 +181,18 @@ impl<T> SingleOrVec<T> {
         self.vectorize().insert(at, value);
     }
 }
+
 enum DrainInner<'a, T> {
     Vec(alloc::vec::Drain<'a, T>),
     Single(&'a mut SingleOrVecInner<T>),
     Done,
 }
+
 pub struct Drain<'a, T> {
     inner: DrainInner<'a, T>,
 }
-impl<'a, T> Iterator for Drain<'a, T> {
+
+impl<T> Iterator for Drain<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -199,7 +209,7 @@ impl<'a, T> Iterator for Drain<'a, T> {
         }
     }
 }
-impl<'a, T> Drop for Drain<'a, T> {
+impl<T> Drop for Drain<'_, T> {
     fn drop(&mut self) {
         if let DrainInner::Single(_) = self.inner {
             self.next();

@@ -16,7 +16,7 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
@@ -32,8 +32,3 @@ pub use ring_buffer::*;
 pub mod stack_buffer;
 #[cfg(feature = "std")]
 pub use stack_buffer::*;
-
-#[cfg(feature = "std")]
-pub mod properties;
-#[cfg(feature = "std")]
-pub use properties::*;

@@ -11,17 +11,24 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{core::Reliability, network::NetworkMessage, transport::TransportSn};
 use alloc::vec::Vec;
+
+use crate::{core::Reliability, network::NetworkMessage, transport::TransportSn};
+
+pub mod flag {
+    pub const R: u8 = 1 << 5; // 0x20 Reliable      if R==1 then the frame is reliable
+                              // pub const X: u8 = 1 << 6; // 0x40       Reserved
+    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
+}
 
 /// # Frame message
 ///
 /// The [`Frame`] message is used to transmit one ore more complete serialized
-/// [`crate::net::protocol::message::ZenohMessage`]. I.e., the total length of the
-/// serialized [`crate::net::protocol::message::ZenohMessage`] (s) MUST be smaller
+/// [`crate::network::NetworkMessage`]. I.e., the total length of the
+/// serialized [`crate::network::NetworkMessage`] (s) MUST be smaller
 /// than the maximum batch size (i.e. 2^16-1) and the link MTU.
 /// The [`Frame`] message is used as means to aggregate multiple
-/// [`crate::net::protocol::message::ZenohMessage`] in a single atomic message that
+/// [`crate::network::NetworkMessage`] in a single atomic message that
 /// goes on the wire. By doing so, many small messages can be batched together and
 /// share common information like the sequence number.
 ///
@@ -60,12 +67,6 @@ use alloc::vec::Vec;
 ///       the boundary of the serialized messages. The length is encoded as little-endian.
 ///       In any case, the length of a message must not exceed 65535 bytes.
 ///
-pub mod flag {
-    pub const R: u8 = 1 << 5; // 0x20 Reliable      if R==1 then the frame is reliable
-                              // pub const X: u8 = 1 << 6; // 0x40       Reserved
-    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub reliability: Reliability,
@@ -94,7 +95,8 @@ impl Frame {
         let ext_qos = ext::QoSType::rand();
         let mut payload = vec![];
         for _ in 0..rng.gen_range(1..4) {
-            let m = NetworkMessage::rand();
+            let mut m = NetworkMessage::rand();
+            m.reliability = reliability;
             payload.push(m);
         }
 

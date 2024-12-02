@@ -11,7 +11,14 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::config::*;
+use std::{
+    fs::File,
+    io,
+    io::{BufReader, Cursor},
+    net::SocketAddr,
+    sync::Arc,
+};
+
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor},
     server::WebPkiClientVerifier,
@@ -19,19 +26,16 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
 };
 use secrecy::ExposeSecret;
-use std::fs::File;
-use std::io;
-use std::net::SocketAddr;
-use std::{
-    io::{BufReader, Cursor},
-    sync::Arc,
-};
 use webpki::anchor_from_trusted_cert;
 use zenoh_config::Config as ZenohConfig;
 use zenoh_link_commons::{tls::WebPkiVerifierAnyServerName, ConfigurationInspector};
-use zenoh_protocol::core::endpoint::Config;
-use zenoh_protocol::core::endpoint::{self, Address};
+use zenoh_protocol::core::{
+    endpoint::{Address, Config},
+    parameters,
+};
 use zenoh_result::{bail, zerror, ZError, ZResult};
+
+use crate::config::*;
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TlsConfigurator;
@@ -58,102 +62,113 @@ impl ConfigurationInspector<ZenohConfig> for TlsConfigurator {
             _ => {}
         }
 
-        match (c.server_private_key(), c.server_private_key_base64()) {
+        match (c.listen_private_key(), c.listen_private_key_base64()) {
             (Some(_), Some(_)) => {
-                bail!("Only one between 'server_private_key' and 'server_private_key_base64' can be present!")
+                bail!("Only one between 'listen_private_key' and 'listen_private_key_base64' can be present!")
             }
             (Some(server_private_key), None) => {
-                ps.push((TLS_SERVER_PRIVATE_KEY_FILE, server_private_key));
+                ps.push((TLS_LISTEN_PRIVATE_KEY_FILE, server_private_key));
             }
             (None, Some(server_private_key)) => {
                 ps.push((
-                    TLS_SERVER_PRIVATE_KEY_BASE64,
+                    TLS_LISTEN_PRIVATE_KEY_BASE64,
                     server_private_key.expose_secret(),
                 ));
             }
             _ => {}
         }
 
-        match (c.server_certificate(), c.server_certificate_base64()) {
+        match (c.listen_certificate(), c.listen_certificate_base64()) {
             (Some(_), Some(_)) => {
-                bail!("Only one between 'server_certificate' and 'server_certificate_base64' can be present!")
+                bail!("Only one between 'listen_certificate' and 'listen_certificate_base64' can be present!")
             }
             (Some(server_certificate), None) => {
-                ps.push((TLS_SERVER_CERTIFICATE_FILE, server_certificate));
+                ps.push((TLS_LISTEN_CERTIFICATE_FILE, server_certificate));
             }
             (None, Some(server_certificate)) => {
                 ps.push((
-                    TLS_SERVER_CERTIFICATE_BASE64,
+                    TLS_LISTEN_CERTIFICATE_BASE64,
                     server_certificate.expose_secret(),
                 ));
             }
             _ => {}
         }
 
-        if let Some(client_auth) = c.client_auth() {
-            match client_auth {
-                true => ps.push((TLS_CLIENT_AUTH, "true")),
-                false => ps.push((TLS_CLIENT_AUTH, "false")),
-            };
+        match c.enable_mtls().unwrap_or(TLS_ENABLE_MTLS_DEFAULT) {
+            true => ps.push((TLS_ENABLE_MTLS, "true")),
+            false => ps.push((TLS_ENABLE_MTLS, "false")),
         }
 
-        match (c.client_private_key(), c.client_private_key_base64()) {
+        match (c.connect_private_key(), c.connect_private_key_base64()) {
             (Some(_), Some(_)) => {
-                bail!("Only one between 'client_private_key' and 'client_private_key_base64' can be present!")
+                bail!("Only one between 'connect_private_key' and 'connect_private_key_base64' can be present!")
             }
             (Some(client_private_key), None) => {
-                ps.push((TLS_CLIENT_PRIVATE_KEY_FILE, client_private_key));
+                ps.push((TLS_CONNECT_PRIVATE_KEY_FILE, client_private_key));
             }
             (None, Some(client_private_key)) => {
                 ps.push((
-                    TLS_CLIENT_PRIVATE_KEY_BASE64,
+                    TLS_CONNECT_PRIVATE_KEY_BASE64,
                     client_private_key.expose_secret(),
                 ));
             }
             _ => {}
         }
 
-        match (c.client_certificate(), c.client_certificate_base64()) {
+        match (c.connect_certificate(), c.connect_certificate_base64()) {
             (Some(_), Some(_)) => {
-                bail!("Only one between 'client_certificate' and 'client_certificate_base64' can be present!")
+                bail!("Only one between 'connect_certificate' and 'connect_certificate_base64' can be present!")
             }
             (Some(client_certificate), None) => {
-                ps.push((TLS_CLIENT_CERTIFICATE_FILE, client_certificate));
+                ps.push((TLS_CONNECT_CERTIFICATE_FILE, client_certificate));
             }
             (None, Some(client_certificate)) => {
                 ps.push((
-                    TLS_CLIENT_CERTIFICATE_BASE64,
+                    TLS_CONNECT_CERTIFICATE_BASE64,
                     client_certificate.expose_secret(),
                 ));
             }
             _ => {}
         }
 
-        if let Some(server_name_verification) = c.server_name_verification() {
-            match server_name_verification {
-                true => ps.push((TLS_SERVER_NAME_VERIFICATION, "true")),
-                false => ps.push((TLS_SERVER_NAME_VERIFICATION, "false")),
-            };
+        match c
+            .verify_name_on_connect()
+            .unwrap_or(TLS_VERIFY_NAME_ON_CONNECT_DEFAULT)
+        {
+            true => ps.push((TLS_VERIFY_NAME_ON_CONNECT, "true")),
+            false => ps.push((TLS_VERIFY_NAME_ON_CONNECT, "false")),
+        };
+
+        match c
+            .close_link_on_expiration()
+            .unwrap_or(TLS_CLOSE_LINK_ON_EXPIRATION_DEFAULT)
+        {
+            true => ps.push((TLS_CLOSE_LINK_ON_EXPIRATION, "true")),
+            false => ps.push((TLS_CLOSE_LINK_ON_EXPIRATION, "false")),
         }
 
-        let mut s = String::new();
-        endpoint::Parameters::extend(ps.drain(..), &mut s);
-
-        Ok(s)
+        Ok(parameters::from_iter(ps.drain(..)))
     }
 }
 
 pub(crate) struct TlsServerConfig {
     pub(crate) server_config: ServerConfig,
+    pub(crate) tls_close_link_on_expiration: bool,
 }
 
 impl TlsServerConfig {
     pub async fn new(config: &Config<'_>) -> ZResult<TlsServerConfig> {
-        let tls_server_client_auth: bool = match config.get(TLS_CLIENT_AUTH) {
+        let tls_server_client_auth: bool = match config.get(TLS_ENABLE_MTLS) {
             Some(s) => s
                 .parse()
-                .map_err(|_| zerror!("Unknown client auth argument: {}", s))?,
-            None => false,
+                .map_err(|_| zerror!("Unknown enable mTLS argument: {}", s))?,
+            None => TLS_ENABLE_MTLS_DEFAULT,
+        };
+        let tls_close_link_on_expiration: bool = match config.get(TLS_CLOSE_LINK_ON_EXPIRATION) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| zerror!("Unknown close on expiration argument: {}", s))?,
+            None => TLS_CLOSE_LINK_ON_EXPIRATION_DEFAULT,
         };
         let tls_server_private_key = TlsServerConfig::load_tls_private_key(config).await?;
         let tls_server_certificate = TlsServerConfig::load_tls_certificate(config).await?;
@@ -199,11 +214,7 @@ impl TlsServerConfig {
 
         let sc = if tls_server_client_auth {
             let root_cert_store = load_trust_anchors(config)?.map_or_else(
-                || {
-                    Err(zerror!(
-                        "Missing root certificates while client authentication is enabled."
-                    ))
-                },
+                || Err(zerror!("Missing root certificates while mTLS is enabled.")),
                 Ok,
             )?;
             let client_auth = WebPkiClientVerifier::builder(root_cert_store.into()).build()?;
@@ -217,15 +228,18 @@ impl TlsServerConfig {
                 .with_single_cert(certs, keys.remove(0))
                 .map_err(|e| zerror!(e))?
         };
-        Ok(TlsServerConfig { server_config: sc })
+        Ok(TlsServerConfig {
+            server_config: sc,
+            tls_close_link_on_expiration,
+        })
     }
 
     async fn load_tls_private_key(config: &Config<'_>) -> ZResult<Vec<u8>> {
         load_tls_key(
             config,
-            TLS_SERVER_PRIVATE_KEY_RAW,
-            TLS_SERVER_PRIVATE_KEY_FILE,
-            TLS_SERVER_PRIVATE_KEY_BASE64,
+            TLS_LISTEN_PRIVATE_KEY_RAW,
+            TLS_LISTEN_PRIVATE_KEY_FILE,
+            TLS_LISTEN_PRIVATE_KEY_BASE64,
         )
         .await
     }
@@ -233,9 +247,9 @@ impl TlsServerConfig {
     async fn load_tls_certificate(config: &Config<'_>) -> ZResult<Vec<u8>> {
         load_tls_certificate(
             config,
-            TLS_SERVER_CERTIFICATE_RAW,
-            TLS_SERVER_CERTIFICATE_FILE,
-            TLS_SERVER_CERTIFICATE_BASE64,
+            TLS_LISTEN_CERTIFICATE_RAW,
+            TLS_LISTEN_CERTIFICATE_FILE,
+            TLS_LISTEN_CERTIFICATE_BASE64,
         )
         .await
     }
@@ -243,28 +257,33 @@ impl TlsServerConfig {
 
 pub(crate) struct TlsClientConfig {
     pub(crate) client_config: ClientConfig,
+    pub(crate) tls_close_link_on_expiration: bool,
 }
 
 impl TlsClientConfig {
     pub async fn new(config: &Config<'_>) -> ZResult<TlsClientConfig> {
-        let tls_client_server_auth: bool = match config.get(TLS_CLIENT_AUTH) {
+        let tls_client_server_auth: bool = match config.get(TLS_ENABLE_MTLS) {
             Some(s) => s
                 .parse()
-                .map_err(|_| zerror!("Unknown client auth argument: {}", s))?,
-            None => false,
+                .map_err(|_| zerror!("Unknown enable mTLS argument: {}", s))?,
+            None => TLS_ENABLE_MTLS_DEFAULT,
         };
 
-        let tls_server_name_verification: bool = match config.get(TLS_SERVER_NAME_VERIFICATION) {
-            Some(s) => {
-                let s: bool = s
-                    .parse()
-                    .map_err(|_| zerror!("Unknown server name verification argument: {}", s))?;
-                if s {
-                    tracing::warn!("Skipping name verification of servers");
-                }
-                s
-            }
-            None => false,
+        let tls_server_name_verification: bool = match config.get(TLS_VERIFY_NAME_ON_CONNECT) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| zerror!("Unknown server name verification argument: {}", s))?,
+            None => TLS_VERIFY_NAME_ON_CONNECT_DEFAULT,
+        };
+        if !tls_server_name_verification {
+            tracing::warn!("Skipping name verification of QUIC server");
+        }
+
+        let tls_close_link_on_expiration: bool = match config.get(TLS_CLOSE_LINK_ON_EXPIRATION) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| zerror!("Unknown close on expiration argument: {}", s))?,
+            None => TLS_CLOSE_LINK_ON_EXPIRATION_DEFAULT,
         };
 
         // Allows mixed user-generated CA and webPKI CA
@@ -353,15 +372,18 @@ impl TlsClientConfig {
                     .with_no_client_auth()
             }
         };
-        Ok(TlsClientConfig { client_config: cc })
+        Ok(TlsClientConfig {
+            client_config: cc,
+            tls_close_link_on_expiration,
+        })
     }
 
     async fn load_tls_private_key(config: &Config<'_>) -> ZResult<Vec<u8>> {
         load_tls_key(
             config,
-            TLS_CLIENT_PRIVATE_KEY_RAW,
-            TLS_CLIENT_PRIVATE_KEY_FILE,
-            TLS_CLIENT_PRIVATE_KEY_BASE64,
+            TLS_CONNECT_PRIVATE_KEY_RAW,
+            TLS_CONNECT_PRIVATE_KEY_FILE,
+            TLS_CONNECT_PRIVATE_KEY_BASE64,
         )
         .await
     }
@@ -369,9 +391,9 @@ impl TlsClientConfig {
     async fn load_tls_certificate(config: &Config<'_>) -> ZResult<Vec<u8>> {
         load_tls_certificate(
             config,
-            TLS_CLIENT_CERTIFICATE_RAW,
-            TLS_CLIENT_CERTIFICATE_FILE,
-            TLS_CLIENT_CERTIFICATE_BASE64,
+            TLS_CONNECT_CERTIFICATE_RAW,
+            TLS_CONNECT_CERTIFICATE_FILE,
+            TLS_CONNECT_CERTIFICATE_BASE64,
         )
         .await
     }
@@ -479,8 +501,7 @@ pub async fn get_quic_addr(address: &Address<'_>) -> ZResult<SocketAddr> {
 }
 
 pub fn base64_decode(data: &str) -> ZResult<Vec<u8>> {
-    use base64::engine::general_purpose;
-    use base64::Engine;
+    use base64::{engine::general_purpose, Engine};
     Ok(general_purpose::STANDARD
         .decode(data)
         .map_err(|e| zerror!("Unable to perform base64 decoding: {e:?}"))?)

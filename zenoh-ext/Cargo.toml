@@ -27,24 +27,30 @@ description = "Zenoh: extensions to the client API."
 maintenance = { status = "actively-developed" }
 
 [features]
-unstable = []
-default = []
+internal = []
+unstable = ["zenoh/unstable", "zenoh/internal"]
 
 [dependencies]
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "io-std"] }
+tokio = { workspace = true, features = [
+  "rt",
+  "sync",
+  "time",
+  "macros",
+  "io-std",
+] }
 bincode = { workspace = true }
-zenoh-util = {workspace = true }
+zenoh-util = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-tracing = {workspace = true}
+tracing = { workspace = true }
 serde = { workspace = true, features = ["default"] }
-zenoh = { workspace = true, features = ["unstable"], default-features = false }
-zenoh-core = { workspace = true }
+leb128 = { workspace = true }
+zenoh = { workspace = true, default-features = false }
 zenoh-macros = { workspace = true }
-zenoh-result = { workspace = true }
-zenoh-sync = { workspace = true }
-zenoh-runtime = { workspace = true }
-zenoh-task = { workspace = true }
+
+[dev-dependencies]
+zenoh-config = { workspace = true }
+rand = { workspace = true }
 
 [package.metadata.docs.rs]
 features = ["unstable"]

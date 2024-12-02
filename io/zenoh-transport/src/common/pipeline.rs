@@ -1,5 +1,3 @@
-use crate::common::batch::BatchConfig;
-
 //
 // Copyright (c) 2023 ZettaScale Technology
 //
@@ -13,18 +11,17 @@ use crate::common::batch::BatchConfig;
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::{
-    batch::{Encode, WBatch},
-    priority::{TransportChannelTx, TransportPriorityTx},
-};
-use flume::{bounded, Receiver, Sender};
-use ringbuffer_spsc::{RingBuffer, RingBufferReader, RingBufferWriter};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 use std::{
-    sync::atomic::{AtomicBool, AtomicU16, Ordering},
-    time::Instant,
+    ops::Add,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::{Duration, Instant},
 };
+
+use crossbeam_utils::CachePadded;
+use ringbuffer_spsc::{RingBuffer, RingBufferReader, RingBufferWriter};
 use zenoh_buffers::{
     reader::{HasReader, Reader},
     writer::HasWriter,
@@ -33,26 +30,28 @@ use zenoh_buffers::{
 use zenoh_codec::{transport::batch::BatchError, WCodec, Zenoh080};
 use zenoh_config::QueueSizeConf;
 use zenoh_core::zlock;
-use zenoh_protocol::core::Reliability;
-use zenoh_protocol::network::NetworkMessage;
 use zenoh_protocol::{
     core::Priority,
+    network::NetworkMessage,
     transport::{
         fragment::FragmentHeader,
         frame::{self, FrameHeader},
-        BatchSize, TransportMessage,
+        AtomicBatchSize, BatchSize, TransportMessage,
     },
 };
+use zenoh_sync::{event, Notifier, Waiter};
 
-// It's faster to work directly with nanoseconds.
-// Backoff will never last more the u32::MAX nanoseconds.
-type NanoSeconds = u32;
+use super::{
+    batch::{Encode, WBatch},
+    priority::{TransportChannelTx, TransportPriorityTx},
+};
+use crate::common::batch::BatchConfig;
 
 const RBLEN: usize = QueueSizeConf::MAX;
 
 // Inner structure to reuse serialization batches
 struct StageInRefill {
-    n_ref_r: Receiver<()>,
+    n_ref_r: Waiter,
     s_ref_r: RingBufferReader<WBatch, RBLEN>,
 }
 
@@ -62,36 +61,48 @@ impl StageInRefill {
     }
 
     fn wait(&self) -> bool {
-        self.n_ref_r.recv().is_ok()
+        self.n_ref_r.wait().is_ok()
     }
 
     fn wait_deadline(&self, instant: Instant) -> bool {
-        self.n_ref_r.recv_deadline(instant).is_ok()
+        self.n_ref_r.wait_deadline(instant).is_ok()
     }
+}
+
+lazy_static::lazy_static! {
+   static ref LOCAL_EPOCH: Instant = Instant::now();
+}
+
+type AtomicMicroSeconds = AtomicU32;
+type MicroSeconds = u32;
+
+struct AtomicBackoff {
+    active: CachePadded<AtomicBool>,
+    bytes: CachePadded<AtomicBatchSize>,
+    first_write: CachePadded<AtomicMicroSeconds>,
 }
 
 // Inner structure to link the initial stage with the final stage of the pipeline
 struct StageInOut {
-    n_out_w: Sender<()>,
+    n_out_w: Notifier,
     s_out_w: RingBufferWriter<WBatch, RBLEN>,
-    bytes: Arc<AtomicU16>,
-    backoff: Arc<AtomicBool>,
+    atomic_backoff: Arc<AtomicBackoff>,
 }
 
 impl StageInOut {
     #[inline]
     fn notify(&self, bytes: BatchSize) {
-        self.bytes.store(bytes, Ordering::Relaxed);
-        if !self.backoff.load(Ordering::Relaxed) {
-            let _ = self.n_out_w.try_send(());
+        self.atomic_backoff.bytes.store(bytes, Ordering::Relaxed);
+        if !self.atomic_backoff.active.load(Ordering::Relaxed) {
+            let _ = self.n_out_w.notify();
         }
     }
 
     #[inline]
     fn move_batch(&mut self, batch: WBatch) {
         let _ = self.s_out_w.push(batch);
-        self.bytes.store(0, Ordering::Relaxed);
-        let _ = self.n_out_w.try_send(());
+        self.atomic_backoff.bytes.store(0, Ordering::Relaxed);
+        let _ = self.n_out_w.notify();
     }
 }
 
@@ -117,12 +128,110 @@ impl StageInMutex {
     }
 }
 
+#[derive(Debug)]
+struct WaitTime {
+    wait_time: Duration,
+    max_wait_time: Option<Duration>,
+}
+
+impl WaitTime {
+    fn new(wait_time: Duration, max_wait_time: Option<Duration>) -> Self {
+        Self {
+            wait_time,
+            max_wait_time,
+        }
+    }
+
+    fn advance(&mut self, instant: &mut Instant) {
+        match &mut self.max_wait_time {
+            Some(max_wait_time) => {
+                if let Some(new_max_wait_time) = max_wait_time.checked_sub(self.wait_time) {
+                    *instant += self.wait_time;
+                    *max_wait_time = new_max_wait_time;
+                    self.wait_time *= 2;
+                }
+            }
+            None => {
+                *instant += self.wait_time;
+            }
+        }
+    }
+
+    fn wait_time(&self) -> Duration {
+        self.wait_time
+    }
+}
+
+#[derive(Clone)]
+enum DeadlineSetting {
+    Immediate,
+    Finite(Instant),
+}
+
+struct LazyDeadline {
+    deadline: Option<DeadlineSetting>,
+    wait_time: WaitTime,
+}
+
+impl LazyDeadline {
+    fn new(wait_time: WaitTime) -> Self {
+        Self {
+            deadline: None,
+            wait_time,
+        }
+    }
+
+    fn advance(&mut self) {
+        match self.deadline().to_owned() {
+            DeadlineSetting::Immediate => {}
+            DeadlineSetting::Finite(mut instant) => {
+                self.wait_time.advance(&mut instant);
+                self.deadline = Some(DeadlineSetting::Finite(instant));
+            }
+        }
+    }
+
+    #[inline]
+    fn deadline(&mut self) -> &mut DeadlineSetting {
+        self.deadline
+            .get_or_insert_with(|| match self.wait_time.wait_time() {
+                Duration::ZERO => DeadlineSetting::Immediate,
+                nonzero_wait_time => DeadlineSetting::Finite(Instant::now().add(nonzero_wait_time)),
+            })
+    }
+}
+
+struct Deadline {
+    lazy_deadline: LazyDeadline,
+}
+
+impl Deadline {
+    fn new(wait_time: Duration, max_wait_time: Option<Duration>) -> Self {
+        Self {
+            lazy_deadline: LazyDeadline::new(WaitTime::new(wait_time, max_wait_time)),
+        }
+    }
+
+    #[inline]
+    fn wait(&mut self, s_ref: &StageInRefill) -> bool {
+        match self.lazy_deadline.deadline() {
+            DeadlineSetting::Immediate => false,
+            DeadlineSetting::Finite(instant) => s_ref.wait_deadline(*instant),
+        }
+    }
+
+    fn on_next_fragment(&mut self) {
+        self.lazy_deadline.advance();
+    }
+}
+
 // This is the initial stage of the pipeline where messages are serliazed on
 struct StageIn {
     s_ref: StageInRefill,
     s_out: StageInOut,
     mutex: StageInMutex,
     fragbuf: ZBuf,
+    batching: bool,
 }
 
 impl StageIn {
@@ -130,43 +239,37 @@ impl StageIn {
         &mut self,
         msg: &mut NetworkMessage,
         priority: Priority,
-        deadline_before_drop: Option<Instant>,
+        deadline: &mut Deadline,
     ) -> bool {
         // Lock the current serialization batch.
         let mut c_guard = self.mutex.current();
 
         macro_rules! zgetbatch_rets {
-            ($fragment:expr, $restore_sn:expr) => {
+            ($($restore_sn:stmt)?) => {
                 loop {
                     match c_guard.take() {
                         Some(batch) => break batch,
                         None => match self.s_ref.pull() {
                             Some(mut batch) => {
                                 batch.clear();
+                                self.s_out.atomic_backoff.first_write.store(
+                                    LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
+                                    Ordering::Relaxed,
+                                );
                                 break batch;
                             }
                             None => {
                                 drop(c_guard);
-                                match deadline_before_drop {
-                                    Some(deadline) if !$fragment => {
-                                        // We are in the congestion scenario and message is droppable
-                                        // Wait for an available batch until deadline
-                                        if !self.s_ref.wait_deadline(deadline) {
-                                            // Still no available batch.
-                                            // Restore the sequence number and drop the message
-                                            $restore_sn;
-                                            return false
-                                        }
-                                    }
-                                    _ => {
-                                        // Block waiting for an available batch
-                                        if !self.s_ref.wait() {
-                                            // Some error prevented the queue to wait and give back an available batch
-                                            // Restore the sequence number and drop the message
-                                            $restore_sn;
-                                            return false;
-                                        }
-                                    }
+                                // Wait for an available batch until deadline
+                                if !deadline.wait(&self.s_ref) {
+                                    // Still no available batch.
+                                    // Restore the sequence number and drop the message
+                                    $($restore_sn)?
+                                    tracing::trace!(
+                                        "Zenoh message dropped because it's over the deadline {:?}: {:?}",
+                                        deadline.lazy_deadline.wait_time, msg
+                                    );
+                                    return false;
                                 }
                                 c_guard = self.mutex.current();
                             }
@@ -177,20 +280,26 @@ impl StageIn {
         }
 
         macro_rules! zretok {
-            ($batch:expr) => {{
-                let bytes = $batch.len();
-                *c_guard = Some($batch);
-                drop(c_guard);
-                self.s_out.notify(bytes);
-                return true;
+            ($batch:expr, $msg:expr) => {{
+                if !self.batching || $msg.is_express() {
+                    // Move out existing batch
+                    self.s_out.move_batch($batch);
+                    return true;
+                } else {
+                    let bytes = $batch.len();
+                    *c_guard = Some($batch);
+                    drop(c_guard);
+                    self.s_out.notify(bytes);
+                    return true;
+                }
             }};
         }
 
         // Get the current serialization batch.
-        let mut batch = zgetbatch_rets!(false, {});
+        let mut batch = zgetbatch_rets!();
         // Attempt the serialization on the current batch
         let e = match batch.encode(&*msg) {
-            Ok(_) => zretok!(batch),
+            Ok(_) => zretok!(batch, msg),
             Err(e) => e,
         };
 
@@ -202,7 +311,7 @@ impl StageIn {
 
         // The Frame
         let frame = FrameHeader {
-            reliability: Reliability::Reliable, // TODO
+            reliability: msg.reliability,
             sn,
             ext_qos: frame::ext::QoSType::new(priority),
         };
@@ -210,19 +319,19 @@ impl StageIn {
         if let BatchError::NewFrame = e {
             // Attempt a serialization with a new frame
             if batch.encode((&*msg, &frame)).is_ok() {
-                zretok!(batch);
+                zretok!(batch, msg);
             }
         }
 
         if !batch.is_empty() {
             // Move out existing batch
             self.s_out.move_batch(batch);
-            batch = zgetbatch_rets!(false, tch.sn.set(sn).unwrap());
+            batch = zgetbatch_rets!(tch.sn.set(sn).unwrap());
         }
 
         // Attempt a second serialization on fully empty batch
         if batch.encode((&*msg, &frame)).is_ok() {
-            zretok!(batch);
+            zretok!(batch, msg);
         }
 
         // The second serialization attempt has failed. This means that the message is
@@ -247,8 +356,9 @@ impl StageIn {
         let mut reader = self.fragbuf.reader();
         while reader.can_read() {
             // Get the current serialization batch
-            // Treat all messages as non-droppable once we start fragmenting
-            batch = zgetbatch_rets!(true, tch.sn.set(sn).unwrap());
+            // If deadline is reached, sequence number is incremented with `SeqNumGenerator::get`
+            // in order to break the fragment chain already sent.
+            batch = zgetbatch_rets!(let _ = tch.sn.get());
 
             // Serialize the message fragment
             match batch.encode((&mut reader, &mut fragment)) {
@@ -270,6 +380,9 @@ impl StageIn {
                     break;
                 }
             }
+
+            // adopt deadline for the next fragment
+            deadline.on_next_fragment();
         }
 
         // Clean the fragbuf
@@ -291,6 +404,10 @@ impl StageIn {
                         None => match self.s_ref.pull() {
                             Some(mut batch) => {
                                 batch.clear();
+                                self.s_out.atomic_backoff.first_write.store(
+                                    LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
+                                    Ordering::Relaxed,
+                                );
                                 break batch;
                             }
                             None => {
@@ -308,17 +425,22 @@ impl StageIn {
 
         macro_rules! zretok {
             ($batch:expr) => {{
-                let bytes = $batch.len();
-                *c_guard = Some($batch);
-                drop(c_guard);
-                self.s_out.notify(bytes);
-                return true;
+                if !self.batching {
+                    // Move out existing batch
+                    self.s_out.move_batch($batch);
+                    return true;
+                } else {
+                    let bytes = $batch.len();
+                    *c_guard = Some($batch);
+                    drop(c_guard);
+                    self.s_out.notify(bytes);
+                    return true;
+                }
             }};
         }
 
         // Get the current serialization batch.
         let mut batch = zgetbatch_rets!();
-        // Attempt the serialization on the current batch
         // Attempt the serialization on the current batch
         match batch.encode(&msg) {
             Ok(_) => zretok!(batch),
@@ -340,53 +462,26 @@ impl StageIn {
 enum Pull {
     Some(WBatch),
     None,
-    Backoff(NanoSeconds),
+    Backoff(MicroSeconds),
 }
 
 // Inner structure to keep track and signal backoff operations
 #[derive(Clone)]
 struct Backoff {
-    tslot: NanoSeconds,
-    retry_time: NanoSeconds,
+    threshold: MicroSeconds,
     last_bytes: BatchSize,
-    bytes: Arc<AtomicU16>,
-    backoff: Arc<AtomicBool>,
+    atomic: Arc<AtomicBackoff>,
+    // active: bool,
 }
 
 impl Backoff {
-    fn new(tslot: NanoSeconds, bytes: Arc<AtomicU16>, backoff: Arc<AtomicBool>) -> Self {
+    fn new(threshold: Duration, atomic: Arc<AtomicBackoff>) -> Self {
         Self {
-            tslot,
-            retry_time: 0,
+            threshold: threshold.as_micros() as MicroSeconds,
             last_bytes: 0,
-            bytes,
-            backoff,
+            atomic,
+            // active: false,
         }
-    }
-
-    fn next(&mut self) {
-        if self.retry_time == 0 {
-            self.retry_time = self.tslot;
-            self.backoff.store(true, Ordering::Relaxed);
-        } else {
-            match self.retry_time.checked_mul(2) {
-                Some(rt) => {
-                    self.retry_time = rt;
-                }
-                None => {
-                    self.retry_time = NanoSeconds::MAX;
-                    tracing::warn!(
-                        "Pipeline pull backoff overflow detected! Retrying in {}ns.",
-                        self.retry_time
-                    );
-                }
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.retry_time = 0;
-        self.backoff.store(false, Ordering::Relaxed);
     }
 }
 
@@ -401,6 +496,7 @@ impl StageOutIn {
     #[inline]
     fn try_pull(&mut self) -> Pull {
         if let Some(batch) = self.s_out_r.pull() {
+            self.backoff.atomic.active.store(false, Ordering::Relaxed);
             return Pull::Some(batch);
         }
 
@@ -408,13 +504,37 @@ impl StageOutIn {
     }
 
     fn try_pull_deep(&mut self) -> Pull {
-        let new_bytes = self.backoff.bytes.load(Ordering::Relaxed);
-        let old_bytes = self.backoff.last_bytes;
-        self.backoff.last_bytes = new_bytes;
+        // Verify first backoff is not active
+        let mut pull = !self.backoff.atomic.active.load(Ordering::Relaxed);
 
-        if new_bytes == old_bytes {
+        // If backoff is active, verify the current number of bytes is equal to the old number
+        // of bytes seen in the previous backoff iteration
+        if !pull {
+            let new_bytes = self.backoff.atomic.bytes.load(Ordering::Relaxed);
+            let old_bytes = self.backoff.last_bytes;
+            self.backoff.last_bytes = new_bytes;
+
+            pull = new_bytes == old_bytes;
+        }
+
+        // Verify that we have not been doing backoff for too long
+        let mut backoff = 0;
+        if !pull {
+            let diff = (LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds)
+                .saturating_sub(self.backoff.atomic.first_write.load(Ordering::Relaxed));
+
+            if diff >= self.backoff.threshold {
+                pull = true;
+            } else {
+                backoff = self.backoff.threshold - diff;
+            }
+        }
+
+        if pull {
             // It seems no new bytes have been written on the batch, try to pull
             if let Ok(mut g) = self.current.try_lock() {
+                self.backoff.atomic.active.store(false, Ordering::Relaxed);
+
                 // First try to pull from stage OUT to make sure we are not in the case
                 // where new_bytes == old_bytes are because of two identical serializations
                 if let Some(batch) = self.s_out_r.pull() {
@@ -431,24 +551,25 @@ impl StageOutIn {
                     }
                 }
             }
-            // Go to backoff
         }
 
+        // Activate backoff
+        self.backoff.atomic.active.store(true, Ordering::Relaxed);
+
         // Do backoff
-        self.backoff.next();
-        Pull::Backoff(self.backoff.retry_time)
+        Pull::Backoff(backoff)
     }
 }
 
 struct StageOutRefill {
-    n_ref_w: Sender<()>,
+    n_ref_w: Notifier,
     s_ref_w: RingBufferWriter<WBatch, RBLEN>,
 }
 
 impl StageOutRefill {
     fn refill(&mut self, batch: WBatch) {
         assert!(self.s_ref_w.push(batch).is_none());
-        let _ = self.n_ref_w.try_send(());
+        let _ = self.n_ref_w.notify();
     }
 }
 
@@ -486,8 +607,10 @@ impl StageOut {
 pub(crate) struct TransmissionPipelineConf {
     pub(crate) batch: BatchConfig,
     pub(crate) queue_size: [usize; Priority::NUM],
-    pub(crate) wait_before_drop: Duration,
-    pub(crate) backoff: Duration,
+    pub(crate) wait_before_drop: (Duration, Duration),
+    pub(crate) wait_before_close: Duration,
+    pub(crate) batching_enabled: bool,
+    pub(crate) batching_time_limit: Duration,
 }
 
 // A 2-stage transmission pipeline
@@ -501,7 +624,7 @@ impl TransmissionPipeline {
         let mut stage_in = vec![];
         let mut stage_out = vec![];
 
-        let default_queue_size = [config.queue_size[Priority::default() as usize]];
+        let default_queue_size = [config.queue_size[Priority::DEFAULT as usize]];
         let size_iter = if priority.len() == 1 {
             default_queue_size.iter()
         } else {
@@ -510,7 +633,7 @@ impl TransmissionPipeline {
 
         // Create the channel for notifying that new batches are in the out ring buffer
         // This is a MPSC channel
-        let (n_out_w, n_out_r) = bounded(1);
+        let (n_out_w, n_out_r) = event::new();
 
         for (prio, num) in size_iter.enumerate() {
             assert!(*num != 0 && *num <= RBLEN);
@@ -525,28 +648,33 @@ impl TransmissionPipeline {
             }
             // Create the channel for notifying that new batches are in the refill ring buffer
             // This is a SPSC channel
-            let (n_ref_w, n_ref_r) = bounded(1);
+            let (n_ref_w, n_ref_r) = event::new();
 
             // Create the refill ring buffer
             // This is a SPSC ring buffer
             let (s_out_w, s_out_r) = RingBuffer::<WBatch, RBLEN>::init();
             let current = Arc::new(Mutex::new(None));
-            let bytes = Arc::new(AtomicU16::new(0));
-            let backoff = Arc::new(AtomicBool::new(false));
+            let bytes = Arc::new(AtomicBackoff {
+                active: CachePadded::new(AtomicBool::new(false)),
+                bytes: CachePadded::new(AtomicBatchSize::new(0)),
+                first_write: CachePadded::new(AtomicMicroSeconds::new(
+                    LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
+                )),
+            });
 
             stage_in.push(Mutex::new(StageIn {
                 s_ref: StageInRefill { n_ref_r, s_ref_r },
                 s_out: StageInOut {
                     n_out_w: n_out_w.clone(),
                     s_out_w,
-                    bytes: bytes.clone(),
-                    backoff: backoff.clone(),
+                    atomic_backoff: bytes.clone(),
                 },
                 mutex: StageInMutex {
                     current: current.clone(),
                     priority: priority[prio].clone(),
                 },
                 fragbuf: ZBuf::empty(),
+                batching: config.batching_enabled,
             }));
 
             // The stage out for this priority
@@ -554,7 +682,7 @@ impl TransmissionPipeline {
                 s_in: StageOutIn {
                     s_out_r,
                     current,
-                    backoff: Backoff::new(config.backoff.as_nanos() as NanoSeconds, bytes, backoff),
+                    backoff: Backoff::new(config.batching_time_limit, bytes),
                 },
                 s_ref: StageOutRefill { n_ref_w, s_ref_w },
             });
@@ -565,6 +693,7 @@ impl TransmissionPipeline {
             stage_in: stage_in.into_boxed_slice().into(),
             active: active.clone(),
             wait_before_drop: config.wait_before_drop,
+            wait_before_close: config.wait_before_close,
         };
         let consumer = TransmissionPipelineConsumer {
             stage_out: stage_out.into_boxed_slice(),
@@ -581,7 +710,8 @@ pub(crate) struct TransmissionPipelineProducer {
     // Each priority queue has its own Mutex
     stage_in: Arc<[Mutex<StageIn>]>,
     active: Arc<AtomicBool>,
-    wait_before_drop: Duration,
+    wait_before_drop: (Duration, Duration),
+    wait_before_close: Duration,
 }
 
 impl TransmissionPipelineProducer {
@@ -592,17 +722,18 @@ impl TransmissionPipelineProducer {
             let priority = msg.priority();
             (priority as usize, priority)
         } else {
-            (0, Priority::default())
+            (0, Priority::DEFAULT)
         };
         // If message is droppable, compute a deadline after which the sample could be dropped
-        let deadline_before_drop = if msg.is_droppable() {
-            Some(Instant::now() + self.wait_before_drop)
+        let (wait_time, max_wait_time) = if msg.is_droppable() {
+            (self.wait_before_drop.0, Some(self.wait_before_drop.1))
         } else {
-            None
+            (self.wait_before_close, None)
         };
+        let mut deadline = Deadline::new(wait_time, max_wait_time);
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
-        queue.push_network_message(&mut msg, priority, deadline_before_drop)
+        queue.push_network_message(&mut msg, priority, &mut deadline)
     }
 
     #[inline]
@@ -636,29 +767,23 @@ impl TransmissionPipelineProducer {
 pub(crate) struct TransmissionPipelineConsumer {
     // A single Mutex for all the priority queues
     stage_out: Box<[StageOut]>,
-    n_out_r: Receiver<()>,
+    n_out_r: Waiter,
     active: Arc<AtomicBool>,
 }
 
 impl TransmissionPipelineConsumer {
     pub(crate) async fn pull(&mut self) -> Option<(WBatch, usize)> {
-        // Reset backoff before pulling
-        for queue in self.stage_out.iter_mut() {
-            queue.s_in.backoff.reset();
-        }
-
         while self.active.load(Ordering::Relaxed) {
+            let mut backoff = MicroSeconds::MAX;
             // Calculate the backoff maximum
-            let mut bo = NanoSeconds::MAX;
             for (prio, queue) in self.stage_out.iter_mut().enumerate() {
                 match queue.try_pull() {
                     Pull::Some(batch) => {
                         return Some((batch, prio));
                     }
-                    Pull::Backoff(b) => {
-                        if b < bo {
-                            bo = b;
-                        }
+                    Pull::Backoff(deadline) => {
+                        backoff = deadline;
+                        break;
                     }
                     Pull::None => {}
                 }
@@ -671,9 +796,11 @@ impl TransmissionPipelineConsumer {
             tokio::task::yield_now().await;
 
             // Wait for the backoff to expire or for a new message
-            let res =
-                tokio::time::timeout(Duration::from_nanos(bo as u64), self.n_out_r.recv_async())
-                    .await;
+            let res = tokio::time::timeout(
+                Duration::from_micros(backoff as u64),
+                self.n_out_r.wait_async(),
+            )
+            .await;
             match res {
                 Ok(Ok(())) => {
                     // We have received a notification from the channel that some bytes are available, retry to pull.
@@ -722,7 +849,6 @@ impl TransmissionPipelineConsumer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{
         convert::TryFrom,
         sync::{
@@ -731,8 +857,8 @@ mod tests {
         },
         time::{Duration, Instant},
     };
-    use tokio::task;
-    use tokio::time::timeout;
+
+    use tokio::{task, time::timeout};
     use zenoh_buffers::{
         reader::{DidntRead, HasReader},
         ZBuf,
@@ -746,6 +872,8 @@ mod tests {
     };
     use zenoh_result::ZResult;
 
+    use super::*;
+
     const SLEEP: Duration = Duration::from_millis(100);
     const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -757,8 +885,10 @@ mod tests {
             is_compression: true,
         },
         queue_size: [1; Priority::NUM],
-        wait_before_drop: Duration::from_millis(1),
-        backoff: Duration::from_micros(1),
+        batching_enabled: true,
+        wait_before_drop: (Duration::from_millis(1), Duration::from_millis(1024)),
+        wait_before_close: Duration::from_secs(5),
+        batching_time_limit: Duration::from_micros(1),
     };
 
     const CONFIG_NOT_STREAMED: TransmissionPipelineConf = TransmissionPipelineConf {
@@ -769,8 +899,10 @@ mod tests {
             is_compression: false,
         },
         queue_size: [1; Priority::NUM],
-        wait_before_drop: Duration::from_millis(1),
-        backoff: Duration::from_micros(1),
+        batching_enabled: true,
+        wait_before_drop: (Duration::from_millis(1), Duration::from_millis(1024)),
+        wait_before_close: Duration::from_secs(5),
+        batching_time_limit: Duration::from_micros(1),
     };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -784,10 +916,10 @@ mod tests {
                 wire_expr: key,
                 ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, false),
                 ext_tstamp: None,
-                ext_nodeid: ext::NodeIdType::default(),
+                ext_nodeid: ext::NodeIdType::DEFAULT,
                 payload: PushBody::Put(Put {
                     timestamp: None,
-                    encoding: Encoding::default(),
+                    encoding: Encoding::empty(),
                     ext_sinfo: None,
                     #[cfg(feature = "shared-memory")]
                     ext_shm: None,
@@ -912,10 +1044,10 @@ mod tests {
                 wire_expr: key,
                 ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, false),
                 ext_tstamp: None,
-                ext_nodeid: ext::NodeIdType::default(),
+                ext_nodeid: ext::NodeIdType::DEFAULT,
                 payload: PushBody::Put(Put {
                     timestamp: None,
-                    encoding: Encoding::default(),
+                    encoding: Encoding::empty(),
                     ext_sinfo: None,
                     #[cfg(feature = "shared-memory")]
                     ext_shm: None,
@@ -1029,10 +1161,10 @@ mod tests {
                             false,
                         ),
                         ext_tstamp: None,
-                        ext_nodeid: ext::NodeIdType::default(),
+                        ext_nodeid: ext::NodeIdType::DEFAULT,
                         payload: PushBody::Put(Put {
                             timestamp: None,
-                            encoding: Encoding::default(),
+                            encoding: Encoding::empty(),
                             ext_sinfo: None,
                             #[cfg(feature = "shared-memory")]
                             ext_shm: None,

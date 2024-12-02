@@ -11,16 +11,22 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{RCodec, WCodec, Zenoh080};
 use core::num::NonZeroUsize;
-use zenoh_buffers::reader::{BacktrackableReader, DidntRead, Reader, SiphonableReader};
-use zenoh_buffers::writer::{BacktrackableWriter, DidntWrite, Writer};
-use zenoh_buffers::ZBufReader;
-use zenoh_protocol::core::Reliability;
-use zenoh_protocol::network::NetworkMessage;
-use zenoh_protocol::transport::{
-    Fragment, FragmentHeader, Frame, FrameHeader, TransportBody, TransportMessage, TransportSn,
+
+use zenoh_buffers::{
+    reader::{BacktrackableReader, DidntRead, Reader, SiphonableReader},
+    writer::{BacktrackableWriter, DidntWrite, Writer},
+    ZBufReader,
 };
+use zenoh_protocol::{
+    core::Reliability,
+    network::NetworkMessage,
+    transport::{
+        Fragment, FragmentHeader, Frame, FrameHeader, TransportBody, TransportMessage, TransportSn,
+    },
+};
+
+use crate::{RCodec, WCodec, Zenoh080};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -144,13 +150,12 @@ where
     fn write(self, writer: &mut W, x: (&NetworkMessage, &FrameHeader)) -> Self::Output {
         let (m, f) = x;
 
-        // @TODO: m.is_reliable() always return true for the time being
-        // if let (Reliability::Reliable, false) | (Reliability::BestEffort, true) =
-        //     (f.reliability, m.is_reliable())
-        // {
-        //     // We are not serializing on the right frame.
-        //     return Err(BatchError::NewFrame);
-        // }
+        if let (Reliability::Reliable, false) | (Reliability::BestEffort, true) =
+            (f.reliability, m.is_reliable())
+        {
+            // We are not serializing on the right frame.
+            return Err(BatchError::NewFrame);
+        }
 
         // Mark the write operation
         let mark = writer.mark();

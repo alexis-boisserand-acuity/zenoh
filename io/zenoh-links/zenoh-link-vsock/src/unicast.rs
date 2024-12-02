@@ -12,30 +12,31 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+use std::{cell::UnsafeCell, collections::HashMap, fmt, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use libc::VMADDR_PORT_ANY;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock as AsyncRwLock;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use zenoh_core::{zasyncread, zasyncwrite};
-use zenoh_link_commons::{
-    LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender,
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::RwLock as AsyncRwLock,
+    task::JoinHandle,
 };
-use zenoh_protocol::core::endpoint::Address;
-use zenoh_protocol::core::{EndPoint, Locator};
-use zenoh_result::{bail, zerror, ZResult};
-
-use super::{VSOCK_ACCEPT_THROTTLE_TIME, VSOCK_DEFAULT_MTU, VSOCK_LOCATOR_PREFIX};
+use tokio_util::sync::CancellationToken;
 use tokio_vsock::{
     VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY, VMADDR_CID_HOST, VMADDR_CID_HYPERVISOR,
     VMADDR_CID_LOCAL,
 };
+use zenoh_core::{zasyncread, zasyncwrite};
+use zenoh_link_commons::{
+    LinkAuthId, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender,
+};
+use zenoh_protocol::{
+    core::{endpoint::Address, EndPoint, Locator},
+    transport::BatchSize,
+};
+use zenoh_result::{bail, zerror, ZResult};
+
+use super::{VSOCK_ACCEPT_THROTTLE_TIME, VSOCK_DEFAULT_MTU, VSOCK_LOCATOR_PREFIX};
 
 pub const VSOCK_VMADDR_CID_ANY: &str = "VMADDR_CID_ANY";
 pub const VSOCK_VMADDR_CID_HYPERVISOR: &str = "VMADDR_CID_HYPERVISOR";
@@ -82,7 +83,7 @@ pub fn get_vsock_addr(address: Address<'_>) -> ZResult<VsockAddr> {
 }
 
 pub struct LinkUnicastVsock {
-    // The underlying socket as returned from the async-std library
+    // The underlying socket as returned from the tokio library
     socket: UnsafeCell<VsockStream>,
     // The source socket address of this link (address used on the local host)
     src_addr: VsockAddr,
@@ -170,7 +171,7 @@ impl LinkUnicastTrait for LinkUnicastVsock {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
+    fn get_mtu(&self) -> BatchSize {
         *VSOCK_DEFAULT_MTU
     }
 
@@ -181,12 +182,17 @@ impl LinkUnicastTrait for LinkUnicastVsock {
 
     #[inline(always)]
     fn is_reliable(&self) -> bool {
-        true
+        super::IS_RELIABLE
     }
 
     #[inline(always)]
     fn is_streamed(&self) -> bool {
         true
+    }
+
+    #[inline(always)]
+    fn get_auth_id(&self) -> &LinkAuthId {
+        &LinkAuthId::NONE
     }
 }
 
@@ -261,25 +267,27 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastVsock {
             // Update the endpoint locator address
             endpoint = EndPoint::new(
                 endpoint.protocol(),
-                &format!("{local_addr}"),
+                format!("{local_addr}"),
                 endpoint.metadata(),
                 endpoint.config(),
             )?;
             let token = CancellationToken::new();
-            let c_token = token.clone();
-
-            let c_manager = self.manager.clone();
 
             let locator = endpoint.to_locator();
 
             let mut listeners = zasyncwrite!(self.listeners);
-            let c_listeners = self.listeners.clone();
-            let c_addr = addr;
-            let task = async move {
-                // Wait for the accept loop to terminate
-                let res = accept_task(listener, c_token, c_manager).await;
-                zasyncwrite!(c_listeners).remove(&c_addr);
-                res
+
+            let task = {
+                let token = token.clone();
+                let manager = self.manager.clone();
+                let listeners = self.listeners.clone();
+
+                async move {
+                    // Wait for the accept loop to terminate
+                    let res = accept_task(listener, token, manager).await;
+                    zasyncwrite!(listeners).remove(&addr);
+                    res
+                }
             };
             let handle = zenoh_runtime::ZRuntime::Acceptor.spawn(task);
 

@@ -11,12 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::{TransportMulticastInner, TransportMulticastPeer};
-use crate::common::{
-    batch::{Decode, RBatch},
-    priority::TransportChannelRx,
-};
 use std::sync::MutexGuard;
+
 use zenoh_core::{zlock, zread};
 use zenoh_protocol::{
     core::{Locator, Priority, Reliability},
@@ -27,6 +23,12 @@ use zenoh_protocol::{
     },
 };
 use zenoh_result::{bail, zerror, ZResult};
+
+use super::transport::{TransportMulticastInner, TransportMulticastPeer};
+use crate::common::{
+    batch::{Decode, RBatch},
+    priority::TransportChannelRx,
+};
 
 /*************************************/
 /*            TRANSPORT RX           */
@@ -42,7 +44,10 @@ impl TransportMulticastInner {
         #[cfg(feature = "shared-memory")]
         {
             if self.manager.config.multicast.is_shm {
-                crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.state.multicast.shm.reader)?;
+                if let Err(e) = crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.shmr) {
+                    tracing::debug!("Error receiving SHM buffer: {e}");
+                    return Ok(());
+                }
             }
         }
 
@@ -145,7 +150,7 @@ impl TransportMulticastInner {
         let priority = ext_qos.priority();
         let c = if self.is_qos() {
             &peer.priority_rx[priority as usize]
-        } else if priority == Priority::default() {
+        } else if priority == Priority::DEFAULT {
             &peer.priority_rx[0]
         } else {
             bail!(
@@ -161,11 +166,14 @@ impl TransportMulticastInner {
             Reliability::BestEffort => zlock!(c.best_effort),
         };
 
-        self.verify_sn(sn, &mut guard)?;
-
+        if !self.verify_sn(sn, &mut guard)? {
+            // Drop invalid message and continue
+            return Ok(());
+        }
         for msg in payload.drain(..) {
             self.trigger_callback(msg, peer)?;
         }
+
         Ok(())
     }
 
@@ -181,7 +189,7 @@ impl TransportMulticastInner {
         let priority = ext_qos.priority();
         let c = if self.is_qos() {
             &peer.priority_rx[priority as usize]
-        } else if priority == Priority::default() {
+        } else if priority == Priority::DEFAULT {
             &peer.priority_rx[0]
         } else {
             bail!(
@@ -197,23 +205,30 @@ impl TransportMulticastInner {
             Reliability::BestEffort => zlock!(c.best_effort),
         };
 
-        self.verify_sn(sn, &mut guard)?;
-
+        if !self.verify_sn(sn, &mut guard)? {
+            // Drop invalid message and continue
+            return Ok(());
+        }
         if guard.defrag.is_empty() {
             let _ = guard.defrag.sync(sn);
         }
-        guard.defrag.push(sn, payload)?;
+        if let Err(e) = guard.defrag.push(sn, payload) {
+            // Defrag errors don't close transport
+            tracing::trace!("{}", e);
+            return Ok(());
+        }
         if !more {
             // When shared-memory feature is disabled, msg does not need to be mutable
-            let msg = guard.defrag.defragment().ok_or_else(|| {
-                zerror!(
+            if let Some(msg) = guard.defrag.defragment() {
+                return self.trigger_callback(msg, peer);
+            } else {
+                tracing::trace!(
                     "Transport: {}. Peer: {}. Priority: {:?}. Defragmentation error.",
                     self.manager.config.zid,
                     peer.zid,
                     priority
-                )
-            })?;
-            return self.trigger_callback(msg, peer);
+                );
+            }
         }
 
         Ok(())
@@ -223,7 +238,7 @@ impl TransportMulticastInner {
         &self,
         sn: TransportSn,
         guard: &mut MutexGuard<'_, TransportChannelRx>,
-    ) -> ZResult<()> {
+    ) -> ZResult<bool> {
         let precedes = guard.sn.precedes(sn)?;
         if !precedes {
             tracing::debug!(
@@ -232,19 +247,14 @@ impl TransportMulticastInner {
                 sn,
                 guard.sn.next()
             );
-            // Drop the fragments if needed
-            if !guard.defrag.is_empty() {
-                guard.defrag.clear();
-            }
-            // Keep reading
-            return Ok(());
+            return Ok(false);
         }
 
         // Set will always return OK because we have already checked
         // with precedes() that the sn has the right resolution
         let _ = guard.sn.set(sn);
 
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn read_messages(

@@ -11,8 +11,9 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{core::WireExpr, zenoh::RequestBody};
 use core::sync::atomic::AtomicU32;
+
+use crate::{core::WireExpr, zenoh::RequestBody};
 
 /// The resolution of a RequestId
 pub type RequestId = u32;
@@ -57,19 +58,19 @@ pub struct Request {
     pub ext_qos: ext::QoSType,
     pub ext_tstamp: Option<ext::TimestampType>,
     pub ext_nodeid: ext::NodeIdType,
-    pub ext_target: ext::TargetType,
+    pub ext_target: ext::QueryTarget,
     pub ext_budget: Option<ext::BudgetType>,
     pub ext_timeout: Option<ext::TimeoutType>,
     pub payload: RequestBody,
 }
 
 pub mod ext {
+    use core::{num::NonZeroU32, time::Duration};
+
     use crate::{
         common::{ZExtZ64, ZExtZBuf},
-        core::QueryTarget,
         zextz64, zextzbuf,
     };
-    use core::{num::NonZeroU32, time::Duration};
 
     pub type QoS = zextz64!(0x1, false);
     pub type QoSType = crate::network::ext::QoSType<{ QoS::ID }>;
@@ -81,29 +82,38 @@ pub mod ext {
     pub type NodeIdType = crate::network::ext::NodeIdType<{ NodeId::ID }>;
 
     pub type Target = zextz64!(0x4, true);
-    /// ```text
-    /// - Target (0x03)
-    ///  7 6 5 4 3 2 1 0
-    /// +-+-+-+-+-+-+-+-+
-    /// %     target    %
-    /// +---------------+
-    ///
-    /// The `zenoh::queryable::Queryable`s that should be target of a `zenoh::Session::get()`.
-    /// ```
-    pub type TargetType = QueryTarget;
+    // ```text
+    // - Target (0x03)
+    //  7 6 5 4 3 2 1 0
+    // +-+-+-+-+-+-+-+-+
+    // %     target    %
+    // +---------------+
+    // ```
+    // The `zenoh::queryable::Queryable`s that should be target of a `zenoh::Session::get()`.
+    #[repr(u8)]
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub enum QueryTarget {
+        /// Let Zenoh find the BestMatching queryable capabale of serving the query.
+        #[default]
+        BestMatching,
+        /// Deliver the query to all queryables matching the query's key expression.
+        All,
+        /// Deliver the query to all queryables matching the query's key expression that are declared as complete.
+        AllComplete,
+    }
 
-    impl TargetType {
+    impl QueryTarget {
+        pub const DEFAULT: Self = Self::BestMatching;
+
         #[cfg(feature = "test")]
         pub fn rand() -> Self {
             use rand::prelude::*;
             let mut rng = rand::thread_rng();
 
             *[
-                TargetType::All,
-                TargetType::AllComplete,
-                TargetType::BestMatching,
-                #[cfg(feature = "complete_n")]
-                TargetType::Complete(rng.gen()),
+                QueryTarget::All,
+                QueryTarget::AllComplete,
+                QueryTarget::BestMatching,
             ]
             .choose(&mut rng)
             .unwrap()
@@ -133,7 +143,7 @@ impl Request {
         let ext_qos = ext::QoSType::rand();
         let ext_tstamp = rng.gen_bool(0.5).then(ext::TimestampType::rand);
         let ext_nodeid = ext::NodeIdType::rand();
-        let ext_target = ext::TargetType::rand();
+        let ext_target = ext::QueryTarget::rand();
         let ext_budget = if rng.gen_bool(0.5) {
             NonZeroU32::new(rng.gen())
         } else {

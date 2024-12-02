@@ -11,26 +11,31 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::face::FaceState;
-pub use super::pubsub::*;
-pub use super::queries::*;
-pub use super::resource::*;
-use crate::net::routing::hat;
-use crate::net::routing::hat::HatTrait;
-use crate::net::routing::interceptor::interceptor_factories;
-use crate::net::routing::interceptor::InterceptorFactory;
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
-use std::sync::{Mutex, RwLock};
-use std::time::Duration;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
+
 use uhlc::HLC;
-use zenoh_config::unwrap_or_default;
-use zenoh_config::Config;
-use zenoh_protocol::core::{ExprId, WhatAmI, ZenohId};
-use zenoh_protocol::network::Mapping;
+use zenoh_config::{unwrap_or_default, Config};
+use zenoh_protocol::{
+    core::{ExprId, WhatAmI, ZenohIdProto},
+    network::Mapping,
+};
 use zenoh_result::ZResult;
 use zenoh_sync::get_mut_unchecked;
+
+use super::face::FaceState;
+pub use super::{pubsub::*, queries::*, resource::*};
+use crate::net::{
+    routing::{
+        hat::{self, HatTrait},
+        interceptor::{interceptor_factories, InterceptorFactory},
+    },
+    runtime::WeakRuntime,
+};
 
 pub(crate) struct RoutingExpr<'a> {
     pub(crate) prefix: &'a Arc<Resource>,
@@ -58,8 +63,9 @@ impl<'a> RoutingExpr<'a> {
 }
 
 pub struct Tables {
-    pub(crate) zid: ZenohId,
+    pub(crate) zid: ZenohIdProto,
     pub(crate) whatami: WhatAmI,
+    pub(crate) runtime: Option<WeakRuntime>,
     pub(crate) face_counter: usize,
     #[allow(dead_code)]
     pub(crate) hlc: Option<Arc<HLC>>,
@@ -70,14 +76,13 @@ pub struct Tables {
     pub(crate) mcast_groups: Vec<Arc<FaceState>>,
     pub(crate) mcast_faces: Vec<Arc<FaceState>>,
     pub(crate) interceptors: Vec<InterceptorFactory>,
-    pub(crate) pull_caches_lock: Mutex<()>,
     pub(crate) hat: Box<dyn Any + Send + Sync>,
     pub(crate) hat_code: Arc<dyn HatTrait + Send + Sync>, // @TODO make this a Box
 }
 
 impl Tables {
     pub fn new(
-        zid: ZenohId,
+        zid: ZenohIdProto,
         whatami: WhatAmI,
         hlc: Option<Arc<HLC>>,
         config: &Config,
@@ -92,6 +97,7 @@ impl Tables {
         Ok(Tables {
             zid,
             whatami,
+            runtime: None,
             face_counter: 0,
             hlc,
             drop_future_timestamp,
@@ -101,7 +107,6 @@ impl Tables {
             mcast_groups: vec![],
             mcast_faces: vec![],
             interceptors: interceptor_factories(config)?,
-            pull_caches_lock: Mutex::new(()),
             hat: hat_code.new_tables(router_peers_failover_brokering),
             hat_code: hat_code.into(),
         })
@@ -144,7 +149,7 @@ impl Tables {
     }
 
     #[inline]
-    pub(crate) fn get_face(&self, zid: &ZenohId) -> Option<&Arc<FaceState>> {
+    pub(crate) fn get_face(&self, zid: &ZenohIdProto) -> Option<&Arc<FaceState>> {
         self.faces.values().find(|face| face.zid == *zid)
     }
 
@@ -165,24 +170,6 @@ impl Tables {
                 }
             }
         }
-    }
-}
-
-pub fn close_face(tables: &TablesLock, face: &Weak<FaceState>) {
-    match face.upgrade() {
-        Some(mut face) => {
-            tracing::debug!("Close {}", face);
-            face.task_controller.terminate_all(Duration::from_secs(10));
-            finalize_pending_queries(tables, &mut face);
-            let mut declares = vec![];
-            let ctrl_lock = zlock!(tables.ctrl_lock);
-            ctrl_lock.close_face(tables, &mut face, &mut |p, m| declares.push((p.clone(), m)));
-            drop(ctrl_lock);
-            for (p, m) in declares {
-                p.send_declare(m);
-            }
-        }
-        None => tracing::error!("Face already closed!"),
     }
 }
 

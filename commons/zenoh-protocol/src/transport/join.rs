@@ -11,11 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use core::time::Duration;
+
 use crate::{
-    core::{Priority, Resolution, WhatAmI, ZenohId},
+    core::{Priority, Resolution, WhatAmI, ZenohIdProto},
     transport::{BatchSize, PrioritySn},
 };
-use core::time::Duration;
 
 /// # Join message
 ///
@@ -38,9 +39,9 @@ use core::time::Duration;
 ///
 /// ```text
 /// Flags:
-/// - T: Lease period   if T==1 then the lease period is in seconds else in milliseconds
+/// - T: Lease period   if T==1 then the lease period is in seconds otherwise it is in milliseconds
 /// - S: Size params    If S==1 then size parameters are exchanged
-/// - Z: Extensions     If Z==1 then zenoh extensions will follow.
+/// - Z: Extensions     If Z==1 then Zenoh extensions will follow.
 ///
 ///  7 6 5 4 3 2 1 0
 /// +-+-+-+-+-+-+-+-+
@@ -50,7 +51,7 @@ use core::time::Duration;
 /// +---------------+
 /// |zid_len|x|x|wai| (#)(*)
 /// +-------+-+-+---+
-/// ~      [u8]     ~ -- ZenohID of the sender of the INIT message
+/// ~      [u8]     ~ -- ZenohID of the sender of the JOIN message
 /// +---------------+
 /// |x|x|x|x|rid|fsn| \                -- SN/ID resolution (+)
 /// +---------------+  | if Flag(S)==1
@@ -59,12 +60,10 @@ use core::time::Duration;
 /// +---------------+
 /// %     lease     % -- Lease period of the sender of the JOIN message
 /// +---------------+
-/// %    next_sn    % -- Next SN to be sent by the sender of the JOIN(^)
+/// %    next_sn    % -- Next SN to be sent by the sender of the JOIN message (^)
 /// +---------------+
 /// ~   [JoinExts]  ~ -- if Flag(Z)==1
 /// +---------------+
-///
-/// If A==1 and S==0 then size parameters are (ie. S flag) are accepted.
 ///
 /// (*) WhatAmI. It indicates the role of the zenoh node sending the JOIN message.
 ///    The valid WhatAmI values are:
@@ -92,19 +91,11 @@ use core::time::Duration;
 ///
 /// (^) The next sequence number MUST be compatible with the adverstised Sequence Number resolution
 /// ```
-///
-
-pub mod flag {
-    pub const T: u8 = 1 << 5; // 0x20 Lease period  if T==1 then the lease period is in seconds else in milliseconds
-    pub const S: u8 = 1 << 6; // 0x40 Size params   if S==1 then size parameters are advertised
-    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Join {
     pub version: u8,
     pub whatami: WhatAmI,
-    pub zid: ZenohId,
+    pub zid: ZenohIdProto,
     pub resolution: Resolution,
     pub batch_size: BatchSize,
     pub lease: Duration,
@@ -113,11 +104,18 @@ pub struct Join {
     pub ext_shm: Option<ext::Shm>,
 }
 
+pub mod flag {
+    pub const T: u8 = 1 << 5; // 0x20 Lease period  if T==1 then the lease period is in seconds else in milliseconds
+    pub const S: u8 = 1 << 6; // 0x40 Size params   if S==1 then size parameters are advertised
+    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
+}
+
 // Extensions
 pub mod ext {
+    use alloc::boxed::Box;
+
     use super::{Priority, PrioritySn};
     use crate::{common::ZExtZBuf, zextzbuf};
-    use alloc::boxed::Box;
 
     /// # QoS extension
     /// Used to announce next sn when QoS is enabled
@@ -132,16 +130,17 @@ pub mod ext {
 impl Join {
     #[cfg(feature = "test")]
     pub fn rand() -> Self {
-        use crate::common::ZExtZBuf;
         use rand::Rng;
+
+        use crate::common::ZExtZBuf;
 
         let mut rng = rand::thread_rng();
 
         let version: u8 = rng.gen();
         let whatami = WhatAmI::rand();
-        let zid = ZenohId::default();
+        let zid = ZenohIdProto::default();
         let resolution = Resolution::rand();
-        let batch_size: u16 = rng.gen();
+        let batch_size: BatchSize = rng.gen();
         let lease = if rng.gen_bool(0.5) {
             Duration::from_secs(rng.gen())
         } else {

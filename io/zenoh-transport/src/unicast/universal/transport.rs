@@ -11,11 +11,29 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::{
+    fmt::DebugStruct,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use zenoh_core::{zasynclock, zcondfeat, zread, zwrite};
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{Priority, WhatAmI, ZenohIdProto},
+    network::NetworkMessage,
+    transport::{close, Close, PrioritySn, TransportMessage, TransportSn},
+};
+use zenoh_result::{bail, zerror, ZResult};
+
 #[cfg(feature = "stats")]
 use crate::stats::TransportStats;
 use crate::{
     common::priority::{TransportPriorityRx, TransportPriorityTx},
     unicast::{
+        authentication::AuthId,
         link::{LinkUnicastWithOpenAck, TransportLinkUnicastDirection},
         transport_unicast_inner::{AddLinkResult, TransportUnicastTrait},
         universal::link::TransportLinkUnicastUniversal,
@@ -23,26 +41,6 @@ use crate::{
     },
     TransportManager, TransportPeerEventHandler,
 };
-use async_trait::async_trait;
-use std::fmt::DebugStruct;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
-use zenoh_core::{zasynclock, zcondfeat, zread, zwrite};
-use zenoh_link::Link;
-use zenoh_protocol::{
-    core::{Priority, WhatAmI, ZenohId},
-    network::NetworkMessage,
-    transport::{close, Close, PrioritySn, TransportMessage, TransportSn},
-};
-use zenoh_result::{bail, zerror, ZResult};
-
-macro_rules! zlinkindex {
-    ($guard:expr, $link:expr) => {
-        // Compare LinkUnicast link to not compare TransportLinkUnicast direction
-        $guard.iter().position(|tl| tl.link == $link)
-    };
-}
 
 /*************************************/
 /*        UNIVERSAL TRANSPORT        */
@@ -131,12 +129,7 @@ impl TransportUnicastUniversal {
         // to avoid concurrent new_transport and closing/closed notifications
         let mut a_guard = self.get_alive().await;
         *a_guard = false;
-
-        // Notify the callback that we are going to close the transport
         let callback = zwrite!(self.callback).take();
-        if let Some(cb) = callback.as_ref() {
-            cb.closing();
-        }
 
         // Delete the transport on the manager
         let _ = self.manager.del_transport_unicast(&self.config.zid).await;
@@ -170,7 +163,15 @@ impl TransportUnicastUniversal {
         let target = {
             let mut guard = zwrite!(self.links);
 
-            if let Some(index) = zlinkindex!(guard, link) {
+            if let Some(index) = guard.iter().position(|tl| {
+                // Compare LinkUnicast link to not compare TransportLinkUnicast direction
+                Link::new_unicast(
+                    &tl.link.link,
+                    tl.link.config.priorities.clone(),
+                    tl.link.config.reliability,
+                )
+                .eq(&link)
+            }) {
                 let is_last = guard.len() == 1;
                 if is_last {
                     // Close the whole transport
@@ -288,7 +289,6 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
         *guard = links.into_boxed_slice();
 
         drop(guard);
-        drop(add_link_guard);
 
         // create a callback to start the link
         let transport = self.clone();
@@ -306,7 +306,7 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
             link.start_rx(transport, other_lease);
         });
 
-        Ok((start_tx, start_rx, ack))
+        Ok((start_tx, start_rx, ack, Some(add_link_guard)))
     }
 
     /*************************************/
@@ -320,7 +320,7 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
         zasynclock!(self.alive)
     }
 
-    fn get_zid(&self) -> ZenohId {
+    fn get_zid(&self) -> ZenohIdProto {
         self.config.zid
     }
 
@@ -330,7 +330,7 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
 
     #[cfg(feature = "shared-memory")]
     fn is_shm(&self) -> bool {
-        self.config.is_shm
+        self.config.shm.is_some()
     }
 
     fn is_qos(&self) -> bool {
@@ -379,6 +379,19 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
 
     fn get_links(&self) -> Vec<Link> {
         zread!(self.links).iter().map(|l| l.link.link()).collect()
+    }
+
+    fn get_auth_ids(&self) -> Vec<AuthId> {
+        // Convert LinkUnicast auth ids to AuthId
+        #[allow(unused_mut)]
+        let mut auth_ids: Vec<AuthId> = zread!(self.links)
+            .iter()
+            .map(|l| l.link.link.get_auth_id().to_owned().into())
+            .collect();
+        // Convert usrpwd auth id to AuthId
+        #[cfg(feature = "auth_usrpwd")]
+        auth_ids.push(self.config.auth_id.clone().into());
+        auth_ids
     }
 
     /*************************************/

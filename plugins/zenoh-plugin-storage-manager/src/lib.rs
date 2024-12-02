@@ -16,41 +16,54 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 #![recursion_limit = "512"]
 
-use async_std::task;
-use flume::Sender;
-use memory_backend::MemoryBackend;
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::sync::Arc;
-use std::sync::Mutex;
-use storages_mgt::StorageMessage;
-use zenoh::plugins::{RunningPluginTrait, ZenohPlugin};
-use zenoh::prelude::sync::*;
-use zenoh::runtime::Runtime;
-use zenoh::Session;
-use zenoh_backend_traits::config::ConfigDiff;
-use zenoh_backend_traits::config::PluginConfig;
-use zenoh_backend_traits::config::StorageConfig;
-use zenoh_backend_traits::config::VolumeConfig;
-use zenoh_backend_traits::VolumeInstance;
-use zenoh_core::zlock;
-use zenoh_plugin_trait::plugin_long_version;
-use zenoh_plugin_trait::plugin_version;
-use zenoh_plugin_trait::Plugin;
-use zenoh_plugin_trait::PluginControl;
-use zenoh_plugin_trait::PluginReport;
-use zenoh_plugin_trait::PluginStatusRec;
-use zenoh_result::ZResult;
-use zenoh_util::LibLoader;
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
-mod backends_mgt;
-use backends_mgt::*;
+use memory_backend::MemoryBackend;
+use storages_mgt::StorageMessage;
+use tokio::sync::broadcast::Sender;
+use zenoh::{
+    internal::{
+        bail,
+        plugins::{Response, RunningPlugin, RunningPluginTrait, ZenohPlugin},
+        runtime::Runtime,
+        zlock, LibLoader,
+    },
+    key_expr::{keyexpr, KeyExpr, OwnedKeyExpr},
+    session::Session,
+    Result as ZResult, Wait,
+};
+use zenoh_backend_traits::{
+    config::{ConfigDiff, PluginConfig, StorageConfig, VolumeConfig},
+    VolumeInstance,
+};
+use zenoh_plugin_trait::{
+    plugin_long_version, plugin_version, Plugin, PluginControl, PluginReport, PluginStatusRec,
+};
+
 mod memory_backend;
-mod replica;
+mod replication;
 mod storages_mgt;
+use storages_mgt::*;
+
+const WORKER_THREAD_NUM: usize = 2;
+const MAX_BLOCK_THREAD_NUM: usize = 50;
+lazy_static::lazy_static! {
+    // The global runtime is used in the zenohd case, which we can't get the current runtime
+    static ref TOKIO_RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
+               .worker_threads(WORKER_THREAD_NUM)
+               .max_blocking_threads(MAX_BLOCK_THREAD_NUM)
+               .enable_all()
+               .build()
+               .expect("Unable to create runtime");
+}
 
 #[cfg(feature = "dynamic_plugin")]
 zenoh_plugin_trait::declare_plugin!(StoragesPlugin);
@@ -63,10 +76,10 @@ impl Plugin for StoragesPlugin {
     const PLUGIN_LONG_VERSION: &'static str = plugin_long_version!();
 
     type StartArgs = Runtime;
-    type Instance = zenoh::plugins::RunningPlugin;
+    type Instance = RunningPlugin;
 
     fn start(name: &str, runtime: &Self::StartArgs) -> ZResult<Self::Instance> {
-        zenoh_util::try_init_log_from_env();
+        zenoh::init_log_from_env_or("error");
         tracing::debug!("StorageManager plugin {}", Self::PLUGIN_VERSION);
         let config =
             { PluginConfig::try_from((name, runtime.config().lock().plugin(name).unwrap())) }?;
@@ -90,8 +103,9 @@ struct StorageRuntimeInner {
 impl StorageRuntimeInner {
     fn status_key(&self) -> String {
         format!(
-            "@/router/{}/status/plugins/{}",
+            "@/{}/{}/status/plugins/{}",
             &self.runtime.zid(),
+            &self.runtime.whatami().to_str(),
             &self.name
         )
     }
@@ -99,7 +113,7 @@ impl StorageRuntimeInner {
         // Try to initiate login.
         // Required in case of dynamic lib, otherwise no logs.
         // But cannot be done twice in case of static link.
-        zenoh_util::try_init_log_from_env();
+        zenoh::init_log_from_env_or("error");
         let PluginConfig {
             name,
             backend_search_dirs,
@@ -107,17 +121,31 @@ impl StorageRuntimeInner {
             storages,
             ..
         } = config;
-        let lib_loader = backend_search_dirs
-            .map(|search_dirs| LibLoader::new(&search_dirs, false))
-            .unwrap_or_default();
+        let lib_loader = LibLoader::new(backend_search_dirs);
 
-        let plugins_manager =
-            PluginsManager::dynamic(lib_loader.clone(), BACKEND_LIB_PREFIX)
-                .declare_static_plugin::<MemoryBackend, &str>(MEMORY_BACKEND_NAME, true);
+        let mut plugins_manager = PluginsManager::dynamic(lib_loader.clone(), BACKEND_LIB_PREFIX);
+        plugins_manager.declare_static_plugin::<MemoryBackend, &str>(MEMORY_BACKEND_NAME, true);
 
-        let session = Arc::new(zenoh::init(runtime.clone()).res_sync()?);
+        let session = Arc::new(zenoh::session::init(runtime.clone()).wait()?);
 
-        // After this moment result should be only Ok. Failure of loading of one voulme or storage should not affect others.
+        // NOTE: All storage **must** have a timestamp associated with a Sample. Considering that it is possible to make
+        //       a publication without associating a timestamp, that means that the node managing the storage (be it a
+        //       Zenoh client / peer / router) has to add it.
+        //
+        //       If the `timestamping` configuration setting is disabled then there is no HLC associated with the
+        //       Session. That eventually means that no timestamp can be generated which goes against the previous
+        //       requirement.
+        //
+        //       Hence, in that scenario, we refuse to start the storage manager and any storage.
+        if session.hlc().is_none() {
+            tracing::error!(
+                "Cannot start storage manager (and thus any storage) without the 'timestamping' \
+                 setting enabled in the Zenoh configuration"
+            );
+            bail!("Cannot start storage manager, 'timestamping' is disabled in the configuration");
+        }
+
+        // After this moment result should be only Ok. Failure of loading of one volume or storage should not affect others.
 
         let mut new_self = StorageRuntimeInner {
             name,
@@ -175,11 +203,13 @@ impl StorageRuntimeInner {
         let name = name.as_ref();
         tracing::info!("Killing volume '{}'", name);
         if let Some(storages) = self.storages.remove(name) {
-            async_std::task::block_on(futures::future::join_all(
-                storages
-                    .into_values()
-                    .map(|s| async move { s.send(StorageMessage::Stop) }),
-            ));
+            tokio::task::block_in_place(|| {
+                TOKIO_RUNTIME.block_on(futures::future::join_all(
+                    storages
+                        .into_values()
+                        .map(|s| async move { s.send(StorageMessage::Stop) }),
+                ))
+            });
         }
         self.plugins_manager
             .started_plugin_mut(name)
@@ -208,7 +238,9 @@ impl StorageRuntimeInner {
             self.plugins_manager
                 .declare_dynamic_plugin_by_name(volume_id, backend_name, true)?
         };
-        let loaded = declared.load()?;
+        let loaded = declared
+            .load()?
+            .expect("Volumes should not loaded if if the storage-manager plugin is not loaded");
         loaded.start(config)?;
 
         Ok(())
@@ -245,16 +277,14 @@ impl StorageRuntimeInner {
             volume_id,
             backend.name()
         );
-        let in_interceptor = backend.instance().incoming_data_interceptor();
-        let out_interceptor = backend.instance().outgoing_data_interceptor();
-        let stopper = async_std::task::block_on(create_and_start_storage(
-            admin_key,
-            storage.clone(),
-            backend.instance(),
-            in_interceptor,
-            out_interceptor,
-            self.session.clone(),
-        ))?;
+        let stopper = tokio::task::block_in_place(|| {
+            TOKIO_RUNTIME.block_on(create_and_start_storage(
+                admin_key,
+                storage.clone(),
+                backend.instance(),
+                self.session.clone(),
+            ))
+        })?;
         self.storages
             .entry(volume_id)
             .or_default()
@@ -305,18 +335,15 @@ impl RunningPluginTrait for StorageRuntime {
 
     fn adminspace_getter<'a>(
         &'a self,
-        selector: &'a Selector<'a>,
+        key_expr: &'a KeyExpr<'a>,
         plugin_status_key: &str,
-    ) -> ZResult<Vec<zenoh::plugins::Response>> {
+    ) -> ZResult<Vec<Response>> {
         let mut responses = Vec::new();
         let mut key = String::from(plugin_status_key);
-        // TODO: to be removed when "__version__" is implemented in admoin space
+        // TODO: to be removed when "__version__" is implemented in admin space
         with_extended_string(&mut key, &["/version"], |key| {
-            if keyexpr::new(key.as_str())
-                .unwrap()
-                .intersects(&selector.key_expr)
-            {
-                responses.push(zenoh::plugins::Response::new(
+            if keyexpr::new(key.as_str()).unwrap().intersects(key_expr) {
+                responses.push(Response::new(
                     key.clone(),
                     StoragesPlugin::PLUGIN_VERSION.into(),
                 ))
@@ -327,21 +354,12 @@ impl RunningPluginTrait for StorageRuntime {
             for plugin in guard.plugins_manager.started_plugins_iter() {
                 with_extended_string(key, &[plugin.id()], |key| {
                     with_extended_string(key, &["/__path__"], |key| {
-                        if keyexpr::new(key.as_str())
-                            .unwrap()
-                            .intersects(&selector.key_expr)
-                        {
-                            responses.push(zenoh::plugins::Response::new(
-                                key.clone(),
-                                plugin.path().into(),
-                            ))
+                        if keyexpr::new(key.as_str()).unwrap().intersects(key_expr) {
+                            responses.push(Response::new(key.clone(), plugin.path().into()))
                         }
                     });
-                    if keyexpr::new(key.as_str())
-                        .unwrap()
-                        .intersects(&selector.key_expr)
-                    {
-                        responses.push(zenoh::plugins::Response::new(
+                    if keyexpr::new(key.as_str()).unwrap().intersects(key_expr) {
+                        responses.push(Response::new(
                             key.clone(),
                             plugin.instance().get_admin_status(),
                         ))
@@ -353,16 +371,15 @@ impl RunningPluginTrait for StorageRuntime {
             for storages in guard.storages.values() {
                 for (storage, handle) in storages {
                     with_extended_string(key, &[storage], |key| {
-                        if keyexpr::new(key.as_str())
-                            .unwrap()
-                            .intersects(&selector.key_expr)
-                        {
-                            if let Ok(value) = task::block_on(async {
-                                let (tx, rx) = async_std::channel::bounded(1);
-                                let _ = handle.send(StorageMessage::GetStatus(tx));
-                                rx.recv().await
+                        if keyexpr::new(key.as_str()).unwrap().intersects(key_expr) {
+                            if let Some(value) = tokio::task::block_in_place(|| {
+                                TOKIO_RUNTIME.block_on(async {
+                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                                    let _ = handle.send(StorageMessage::GetStatus(tx));
+                                    rx.recv().await
+                                })
                             }) {
-                                responses.push(zenoh::plugins::Response::new(key.clone(), value))
+                                responses.push(Response::new(key.clone(), value))
                             }
                         }
                     })
@@ -388,4 +405,80 @@ fn with_extended_string<R, F: FnMut(&mut String) -> R>(
     let result = closure(prefix);
     prefix.truncate(prefix_len);
     result
+}
+
+/// Returns the key expression stripped of the provided prefix.
+///
+/// If no prefix is provided this function returns the key expression untouched.
+///
+/// If `None` is returned, it indicates that the key expression is equal to the prefix.
+///
+/// This function will internally call [strip_prefix], see its documentation for possible outcomes.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The provided prefix contains a wildcard.
+///   NOTE: The configuration of a Storage is checked and will reject any prefix that contains a
+///   wildcard. In theory, this error should never occur.
+/// - The key expression is not prefixed by the provided prefix.
+/// - The resulting stripped key is not a valid key expression (this should, in theory, never
+///   happen).
+///
+/// [strip_prefix]: zenoh::key_expr::keyexpr::strip_prefix()
+pub fn strip_prefix(
+    maybe_prefix: Option<&OwnedKeyExpr>,
+    key_expr: &KeyExpr<'_>,
+) -> ZResult<Option<OwnedKeyExpr>> {
+    match maybe_prefix {
+        None => Ok(Some(key_expr.clone().into())),
+        Some(prefix) => {
+            if prefix.is_wild() {
+                bail!(
+                    "Prefix < {} > contains a wild character (\"**\" or \"*\")",
+                    prefix
+                );
+            }
+
+            // `key_expr.strip_prefix` returns empty vec if `key_expr == prefix`,
+            // but also returns empty vec if `prefix` is not a prefix to `key_expr`.
+            // First case needs to be handled before calling `key_expr.strip_prefix`
+            if key_expr.as_str().eq(prefix.as_str()) {
+                return Ok(None);
+            }
+
+            match key_expr.strip_prefix(prefix).as_slice() {
+                // NOTE: `stripped_key_expr.is_empty()` should be impossible as "" is not a valid key expression
+                [stripped_key_expr] => OwnedKeyExpr::from_str(stripped_key_expr).map(Some),
+                _ => bail!("Failed to strip prefix < {} > from: {}", prefix, key_expr),
+            }
+        }
+    }
+}
+
+/// Returns the key with an additional prefix, if both were provided.
+///
+/// If no prefix is provided, this function returns `maybe_stripped_key`.
+///
+/// If no key is provided, this function returns the `maybe_prefix`.
+///
+/// If a prefix is provided, this function returns the concatenation of both.
+///
+/// # Error
+///
+/// This function will return an error if both `maybe_prefix` and `maybe_stripped_key` are equal to
+/// `None`. This situation can happen if (i) the "backend" associated to a Storage is first started
+/// with a `strip_prefix` set to some value, (ii) a key equal to the `strip_prefix` is published
+/// (hence storing `None`) then (iii) the Storage is stopped and the "backend" is associated to
+/// another Storage without a `strip_prefix` configured.
+pub fn prefix(
+    maybe_prefix: Option<&OwnedKeyExpr>,
+    maybe_stripped_key: Option<&OwnedKeyExpr>,
+) -> ZResult<OwnedKeyExpr> {
+    match (maybe_prefix, maybe_stripped_key) {
+        (Some(prefix), Some(stripped_key)) => Ok(prefix / stripped_key),
+        (Some(prefix), None) => Ok(prefix.clone()),
+        (None, Some(key)) => Ok(key.clone()),
+        (None, None) => bail!("Fatal internal error: empty prefix with empty key"),
+    }
 }

@@ -11,8 +11,32 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::time::Duration;
+
+use async_trait::async_trait;
+use rand::Rng;
+use tokio::sync::Mutex;
+use zenoh_buffers::{reader::HasReader, writer::HasWriter, ZSlice};
+use zenoh_codec::{RCodec, WCodec, Zenoh080};
+use zenoh_core::{zasynclock, zcondfeat, zerror};
+use zenoh_crypto::{BlockCipher, PseudoRng};
+use zenoh_link::LinkUnicast;
+use zenoh_protocol::{
+    core::{Field, Resolution, WhatAmI, ZenohIdProto},
+    transport::{
+        batch_size,
+        close::{self, Close},
+        BatchSize, InitAck, OpenAck, TransportBody, TransportMessage, TransportSn,
+    },
+};
+use zenoh_result::ZResult;
+
+#[cfg(feature = "auth_usrpwd")]
+use super::ext::auth::UsrPwdId;
 #[cfg(feature = "shared-memory")]
-use crate::unicast::shared_memory_unicast::Challenge;
+use super::ext::shm::AuthSegment;
+#[cfg(feature = "shared-memory")]
+use crate::shm::TransportShmConfig;
 use crate::{
     common::batch::BatchConfig,
     unicast::{
@@ -25,24 +49,6 @@ use crate::{
     },
     TransportManager,
 };
-use async_trait::async_trait;
-use rand::Rng;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use zenoh_buffers::{reader::HasReader, writer::HasWriter, ZSlice};
-use zenoh_codec::{RCodec, WCodec, Zenoh080};
-use zenoh_core::{zasynclock, zcondfeat, zerror};
-use zenoh_crypto::{BlockCipher, PseudoRng};
-use zenoh_link::LinkUnicast;
-use zenoh_protocol::{
-    core::{Field, Resolution, WhatAmI, ZenohId},
-    transport::{
-        batch_size,
-        close::{self, Close},
-        BatchSize, InitAck, OpenAck, TransportBody, TransportMessage, TransportSn,
-    },
-};
-use zenoh_result::ZResult;
 
 pub(super) type AcceptError = (zenoh_result::Error, Option<u8>);
 
@@ -76,24 +82,26 @@ struct RecvInitSynIn {
     mine_version: u8,
 }
 struct RecvInitSynOut {
-    other_zid: ZenohId,
+    other_zid: ZenohIdProto,
     other_whatami: WhatAmI,
     #[cfg(feature = "shared-memory")]
-    ext_shm: Challenge,
+    ext_shm: Option<AuthSegment>,
 }
 
 // InitAck
 struct SendInitAckIn {
     mine_version: u8,
-    mine_zid: ZenohId,
+    mine_zid: ZenohIdProto,
     mine_whatami: WhatAmI,
-    other_zid: ZenohId,
+    other_zid: ZenohIdProto,
     other_whatami: WhatAmI,
     #[cfg(feature = "shared-memory")]
-    ext_shm: Challenge,
+    ext_shm: Option<AuthSegment>,
 }
 struct SendInitAckOut {
     cookie_nonce: u64,
+    #[cfg(feature = "shared-memory")]
+    ext_shm: Option<AuthSegment>,
 }
 
 // OpenSyn
@@ -101,17 +109,19 @@ struct RecvOpenSynIn {
     cookie_nonce: u64,
 }
 struct RecvOpenSynOut {
-    other_zid: ZenohId,
+    other_zid: ZenohIdProto,
     other_whatami: WhatAmI,
     other_lease: Duration,
     other_initial_sn: TransportSn,
+    #[cfg(feature = "auth_usrpwd")]
+    other_auth_id: UsrPwdId,
 }
 
 // OpenAck
 struct SendOpenAckIn {
-    mine_zid: ZenohId,
+    mine_zid: ZenohIdProto,
     mine_lease: Duration,
-    other_zid: ZenohId,
+    other_zid: ZenohIdProto,
 }
 struct SendOpenAckOut {
     open_ack: OpenAck,
@@ -126,7 +136,8 @@ struct AcceptLink<'a> {
     #[cfg(feature = "transport_multilink")]
     ext_mlink: ext::multilink::MultiLinkFsm<'a>,
     #[cfg(feature = "shared-memory")]
-    ext_shm: ext::shm::ShmFsm<'a>,
+    // Will be None if SHM operation is disabled by Config
+    ext_shm: Option<ext::shm::ShmFsm<'a>>,
     #[cfg(feature = "transport_auth")]
     ext_auth: ext::auth::AuthFsm<'a>,
     ext_lowlatency: ext::lowlatency::LowLatencyFsm<'a>,
@@ -152,6 +163,12 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::INVALID)))?;
 
+        tracing::trace!(
+            "Establishment Accept InitSyn: {}. Received: {:?}",
+            self.link,
+            msg
+        );
+
         let init_syn = match msg.body {
             TransportBody::InitSyn(init_syn) => init_syn,
             _ => {
@@ -167,9 +184,11 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
         // Check if the version is supported
         if init_syn.version != input.mine_version {
             let e = zerror!(
-                "Rejecting InitSyn on {} because of unsupported Zenoh version from peer: {}",
+                "Rejecting InitSyn on {} because of unsupported Zenoh protocol version (expected: {}, received: {}) from: {}",
                 self.link,
-                init_syn.zid
+                input.mine_version,
+                init_syn.version,
+                init_syn.zid,
             );
             return Err((e.into(), Some(close::reason::INVALID)));
         }
@@ -192,25 +211,35 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
         };
 
         // Compute the minimum batch size
-        state.transport.batch_size = state
-            .transport
-            .batch_size
-            .min(init_syn.batch_size)
-            .min(batch_size::UNICAST);
+        // Clippy raises a warning because `batch_size::UNICAST` is currently equal to `BatchSize::MAX`.
+        // However, the current code catches the cases where `batch_size::UNICAST` is different from `BatchSize::MAX`.
+        #[allow(clippy::unnecessary_min_or_max)]
+        {
+            state.transport.batch_size = state
+                .transport
+                .batch_size
+                .min(init_syn.batch_size)
+                .min(batch_size::UNICAST);
+        }
 
         // Extension QoS
         self.ext_qos
-            .recv_init_syn((&mut state.transport.ext_qos, init_syn.ext_qos))
+            .recv_init_syn((
+                &mut state.transport.ext_qos,
+                (init_syn.ext_qos, init_syn.ext_qos_link),
+            ))
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
         // Extension Shm
         #[cfg(feature = "shared-memory")]
-        let ext_shm = self
-            .ext_shm
-            .recv_init_syn((&mut state.transport.ext_shm, init_syn.ext_shm))
-            .await
-            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+        let ext_shm = match &self.ext_shm {
+            Some(my_shm) => my_shm
+                .recv_init_syn(init_syn.ext_shm)
+                .await
+                .map_err(|e| (e, Some(close::reason::GENERIC)))?,
+            _ => None,
+        };
 
         // Extension Auth
         #[cfg(feature = "transport_auth")]
@@ -258,21 +287,21 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
         let (mut state, input) = input;
 
         // Extension QoS
-        let ext_qos = self
+        let (ext_qos, ext_qos_link) = self
             .ext_qos
             .send_init_ack(&state.transport.ext_qos)
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
         // Extension Shm
-        let ext_shm = zcondfeat!(
-            "shared-memory",
-            self.ext_shm
-                .send_init_ack((&mut state.transport.ext_shm, input.ext_shm))
+        #[cfg(feature = "shared-memory")]
+        let ext_shm = match self.ext_shm.as_ref() {
+            Some(my_shm) => my_shm
+                .send_init_ack(&input.ext_shm)
                 .await
                 .map_err(|e| (e, Some(close::reason::GENERIC)))?,
-            None
-        );
+            _ => None,
+        };
 
         // Extension Auth
         let ext_auth = zcondfeat!(
@@ -347,7 +376,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
         let cookie: ZSlice = encrypted.into();
 
         // Send the message on the link
-        let message: TransportMessage = InitAck {
+        let msg: TransportMessage = InitAck {
             version: input.mine_version,
             whatami: input.mine_whatami,
             zid: input.mine_zid,
@@ -355,6 +384,8 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             batch_size: state.transport.batch_size,
             cookie,
             ext_qos,
+            ext_qos_link,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
@@ -365,11 +396,21 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
 
         let _ = self
             .link
-            .send(&message)
+            .send(&msg)
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
-        let output = SendInitAckOut { cookie_nonce };
+        tracing::trace!(
+            "Establishment Accept InitAck: {}. Sent: {:?}",
+            self.link,
+            msg
+        );
+
+        let output = SendInitAckOut {
+            cookie_nonce,
+            #[cfg(feature = "shared-memory")]
+            ext_shm: input.ext_shm,
+        };
         Ok(output)
     }
 
@@ -384,6 +425,12 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .recv()
             .await
             .map_err(|e| (e, Some(close::reason::INVALID)))?;
+
+        tracing::trace!(
+            "Establishment Accept OpenSyn: {}. Received: {:?}",
+            self.link,
+            msg
+        );
 
         let open_syn = match msg.body {
             TransportBody::OpenSyn(open_syn) => open_syn,
@@ -462,17 +509,21 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
 
         // Extension Shm
         #[cfg(feature = "shared-memory")]
-        self.ext_shm
-            .recv_open_syn((&mut state.transport.ext_shm, open_syn.ext_shm))
-            .await
-            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+        if let Some(my_shm) = self.ext_shm.as_ref() {
+            my_shm
+                .recv_open_syn((&mut state.transport.ext_shm, open_syn.ext_shm))
+                .await
+                .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+        }
 
         // Extension Auth
-        #[cfg(feature = "transport_auth")]
-        self.ext_auth
+        #[cfg(feature = "auth_usrpwd")]
+        let user_password_id = self
+            .ext_auth
             .recv_open_syn((&mut state.link.ext_auth, open_syn.ext_auth))
             .await
-            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?
+            .auth_id;
 
         // Extension MultiLink
         #[cfg(feature = "transport_multilink")]
@@ -499,6 +550,8 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             other_whatami: cookie.whatami,
             other_lease: open_syn.lease,
             other_initial_sn: open_syn.initial_sn,
+            #[cfg(feature = "auth_usrpwd")]
+            other_auth_id: user_password_id,
         };
         Ok((state, output))
     }
@@ -526,14 +579,14 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
         // Extension Shm
-        let ext_shm = zcondfeat!(
-            "shared-memory",
-            self.ext_shm
-                .send_open_ack(&mut state.transport.ext_shm)
+        #[cfg(feature = "shared-memory")]
+        let ext_shm = match self.ext_shm.as_ref() {
+            Some(my_shm) => my_shm
+                .send_open_ack(&state.transport.ext_shm)
                 .await
                 .map_err(|e| (e, Some(close::reason::GENERIC)))?,
-            None
-        );
+            None => None,
+        };
 
         // Extension Auth
         let ext_auth = zcondfeat!(
@@ -568,10 +621,11 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
         // Build OpenAck message
         let mine_initial_sn =
             compute_sn(input.mine_zid, input.other_zid, state.transport.resolution);
-        let open_ack = OpenAck {
+        let msg = OpenAck {
             lease: input.mine_lease,
             initial_sn: mine_initial_sn,
             ext_qos,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
@@ -580,23 +634,32 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
         };
 
         // Do not send the OpenAck right now since we might still incur in MAX_LINKS error
+        tracing::trace!(
+            "Establishment Accept OpenAck: {}. Sent: {:?}",
+            self.link,
+            msg
+        );
 
-        let output = SendOpenAckOut { open_ack };
+        let output = SendOpenAckOut { open_ack: msg };
         Ok(output)
     }
 }
 
 pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -> ZResult<()> {
+    let endpoint = link.get_src().to_endpoint();
+    let direction = TransportLinkUnicastDirection::Inbound;
     let mtu = link.get_mtu();
     let is_streamed = link.is_streamed();
     let config = TransportLinkUnicastConfig {
-        direction: TransportLinkUnicastDirection::Inbound,
+        direction,
         batch: BatchConfig {
             mtu,
             is_streamed,
             #[cfg(feature = "transport_compression")]
             is_compression: false,
         },
+        priorities: None,
+        reliability: None,
     };
     let mut link = TransportLinkUnicast::new(link, config);
     let mut fsm = AcceptLink {
@@ -605,7 +668,12 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         cipher: &manager.cipher,
         ext_qos: ext::qos::QoSFsm::new(),
         #[cfg(feature = "shared-memory")]
-        ext_shm: ext::shm::ShmFsm::new(&manager.state.unicast.shm),
+        ext_shm: manager
+            .state
+            .unicast
+            .auth_shm
+            .as_ref()
+            .map(ext::shm::ShmFsm::new),
         #[cfg(feature = "transport_multilink")]
         ext_mlink: manager.state.unicast.multilink.fsm(&manager.prng),
         #[cfg(feature = "transport_auth")]
@@ -629,12 +697,17 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         };
     }
 
+    // Clippy raises a warning because `batch_size::UNICAST` is currently equal to `BatchSize::MAX`.
+    // However, the current code catches the cases where `batch_size::UNICAST` is different from `BatchSize::MAX`.
+    #[allow(clippy::unnecessary_min_or_max)]
+    let batch_size = manager.config.batch_size.min(batch_size::UNICAST).min(mtu);
+
     let iack_out = {
         let mut state = State {
             transport: StateTransport {
-                batch_size: manager.config.batch_size.min(batch_size::UNICAST).min(mtu),
+                batch_size,
                 resolution: manager.config.resolution,
-                ext_qos: ext::qos::StateAccept::new(manager.config.unicast.is_qos),
+                ext_qos: ext::qos::StateAccept::new(manager.config.unicast.is_qos, &endpoint)?,
                 #[cfg(feature = "transport_multilink")]
                 ext_mlink: manager
                     .state
@@ -642,7 +715,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
                     .multilink
                     .accept(manager.config.unicast.max_links > 1),
                 #[cfg(feature = "shared-memory")]
-                ext_shm: ext::shm::StateAccept::new(manager.config.unicast.is_shm),
+                ext_shm: ext::shm::StateAccept::new(),
                 ext_lowlatency: ext::lowlatency::StateAccept::new(
                     manager.config.unicast.is_lowlatency,
                 ),
@@ -706,18 +779,25 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         #[cfg(feature = "transport_multilink")]
         multilink: state.transport.ext_mlink.multilink(),
         #[cfg(feature = "shared-memory")]
-        is_shm: state.transport.ext_shm.is_shm(),
+        shm: match state.transport.ext_shm.negotiated_to_use_shm() {
+            true => iack_out.ext_shm.map(TransportShmConfig::new),
+            false => None,
+        },
         is_lowlatency: state.transport.ext_lowlatency.is_lowlatency(),
+        #[cfg(feature = "auth_usrpwd")]
+        auth_id: osyn_out.other_auth_id,
     };
 
     let a_config = TransportLinkUnicastConfig {
-        direction: TransportLinkUnicastDirection::Inbound,
+        direction,
         batch: BatchConfig {
             mtu: state.transport.batch_size,
             is_streamed,
             #[cfg(feature = "transport_compression")]
             is_compression: state.link.ext_compression.is_compression(),
         },
+        priorities: state.transport.ext_qos.priorities(),
+        reliability: state.transport.ext_qos.reliability(),
     };
     let a_link = link.reconfigure(a_config);
     let s_link = format!("{:?}", a_link);
@@ -732,7 +812,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         .await?;
 
     tracing::debug!(
-        "New transport link accepted from {} to {}: {}.",
+        "New transport link accepted from {} to {}: {}",
         osyn_out.other_zid,
         manager.config.zid,
         s_link,

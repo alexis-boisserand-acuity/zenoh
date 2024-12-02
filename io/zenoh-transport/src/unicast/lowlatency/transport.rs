@@ -11,33 +11,34 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::{
+    sync::{Arc, RwLock as SyncRwLock},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use zenoh_core::{zasynclock, zasyncread, zasyncwrite, zread, zwrite};
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{WhatAmI, ZenohIdProto},
+    network::NetworkMessage,
+    transport::{close, Close, TransportBodyLowLatency, TransportMessageLowLatency, TransportSn},
+};
+use zenoh_result::{zerror, ZResult};
+
 #[cfg(feature = "stats")]
 use crate::stats::TransportStats;
 use crate::{
     unicast::{
+        authentication::AuthId,
         link::{LinkUnicastWithOpenAck, TransportLinkUnicast},
         transport_unicast_inner::{AddLinkResult, TransportUnicastTrait},
         TransportConfigUnicast,
     },
     TransportManager, TransportPeerEventHandler,
 };
-use async_trait::async_trait;
-use std::sync::{Arc, RwLock as SyncRwLock};
-use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock};
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
-use zenoh_core::{zasynclock, zasyncread, zasyncwrite, zread, zwrite};
-use zenoh_link::Link;
-use zenoh_protocol::network::NetworkMessage;
-use zenoh_protocol::transport::TransportBodyLowLatency;
-use zenoh_protocol::transport::TransportMessageLowLatency;
-use zenoh_protocol::transport::{Close, TransportSn};
-use zenoh_protocol::{
-    core::{WhatAmI, ZenohId},
-    transport::close,
-};
-use zenoh_result::{zerror, ZResult};
 
 /*************************************/
 /*       LOW-LATENCY TRANSPORT       */
@@ -116,12 +117,7 @@ impl TransportUnicastLowlatency {
         // to avoid concurrent new_transport and closing/closed notifications
         let mut a_guard = self.get_alive().await;
         *a_guard = false;
-
-        // Notify the callback that we are going to close the transport
         let callback = zwrite!(self.callback).take();
-        if let Some(cb) = callback.as_ref() {
-            cb.closing();
-        }
 
         // Delete the transport on the manager
         let _ = self.manager.del_transport_unicast(&self.config.zid).await;
@@ -183,8 +179,23 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
         vec![]
     }
 
-    fn get_zid(&self) -> ZenohId {
+    fn get_zid(&self) -> ZenohIdProto {
         self.config.zid
+    }
+
+    fn get_auth_ids(&self) -> Vec<AuthId> {
+        // Convert LinkUnicast auth id to AuthId
+        let mut auth_ids: Vec<AuthId> = vec![];
+        let handle = tokio::runtime::Handle::current();
+        let guard =
+            tokio::task::block_in_place(|| handle.block_on(async { zasyncread!(self.link) }));
+        if let Some(val) = guard.as_ref() {
+            auth_ids.push(val.link.get_auth_id().to_owned().into());
+        }
+        // Convert usrpwd auth id to AuthId
+        #[cfg(feature = "auth_usrpwd")]
+        auth_ids.push(self.config.auth_id.clone().into());
+        auth_ids
     }
 
     fn get_whatami(&self) -> WhatAmI {
@@ -193,7 +204,7 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
 
     #[cfg(feature = "shared-memory")]
     fn is_shm(&self) -> bool {
-        self.config.is_shm
+        self.config.shm.is_some()
     }
 
     fn is_qos(&self) -> bool {
@@ -258,7 +269,7 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
             self.internal_start_rx(other_lease);
         });
 
-        Ok((start_tx, start_rx, ack))
+        Ok((start_tx, start_rx, ack, None))
     }
 
     /*************************************/

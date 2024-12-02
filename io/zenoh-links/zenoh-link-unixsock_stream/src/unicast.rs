@@ -11,30 +11,34 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::UNIXSOCKSTREAM_ACCEPT_THROTTLE_TIME;
+use std::{
+    cell::UnsafeCell, collections::HashMap, fmt, fs::remove_file, os::unix::io::RawFd,
+    path::PathBuf, sync::Arc, time::Duration,
+};
+
 use async_trait::async_trait;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::fs::remove_file;
-use std::os::unix::io::RawFd;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::RwLock as AsyncRwLock;
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+    sync::RwLock as AsyncRwLock,
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zenoh_core::{zasyncread, zasyncwrite};
 use zenoh_link_commons::{
-    LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender,
+    LinkAuthId, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender,
 };
-use zenoh_protocol::core::{EndPoint, Locator};
+use zenoh_protocol::{
+    core::{EndPoint, Locator},
+    transport::BatchSize,
+};
 use zenoh_result::{zerror, ZResult};
 
-use super::{get_unix_path_as_string, UNIXSOCKSTREAM_DEFAULT_MTU, UNIXSOCKSTREAM_LOCATOR_PREFIX};
+use super::{
+    get_unix_path_as_string, UNIXSOCKSTREAM_ACCEPT_THROTTLE_TIME, UNIXSOCKSTREAM_DEFAULT_MTU,
+    UNIXSOCKSTREAM_LOCATOR_PREFIX,
+};
 
 pub struct LinkUnicastUnixSocketStream {
     // The underlying socket as returned from the tokio library
@@ -119,7 +123,7 @@ impl LinkUnicastTrait for LinkUnicastUnixSocketStream {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
+    fn get_mtu(&self) -> BatchSize {
         *UNIXSOCKSTREAM_DEFAULT_MTU
     }
 
@@ -132,12 +136,17 @@ impl LinkUnicastTrait for LinkUnicastUnixSocketStream {
 
     #[inline(always)]
     fn is_reliable(&self) -> bool {
-        true
+        super::IS_RELIABLE
     }
 
     #[inline(always)]
     fn is_streamed(&self) -> bool {
         true
+    }
+
+    #[inline(always)]
+    fn get_auth_id(&self) -> &LinkAuthId {
+        &LinkAuthId::NONE
     }
 }
 
@@ -319,10 +328,12 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         })?;
 
         // We try to acquire the lock
+        // @TODO: flock is deprecated and upgrading to new Flock will require some refactoring of this module
+        #[allow(deprecated)]
         nix::fcntl::flock(lock_fd, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|e| {
             let _ = nix::unistd::close(lock_fd);
             let e = zerror!(
-                "Can not create a new UnixSocketStream listener on {} - Unable to acquire look: {}",
+                "Can not create a new UnixSocketStream listener on {} - Unable to acquire lock: {}",
                 path,
                 e
             );
@@ -381,15 +392,17 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         let c_token = token.clone();
         let mut listeners = zasyncwrite!(self.listeners);
 
-        let c_manager = self.manager.clone();
-        let c_listeners = self.listeners.clone();
-        let c_path = local_path_str.to_owned();
+        let task = {
+            let manager = self.manager.clone();
+            let listeners = self.listeners.clone();
+            let path = local_path_str.to_owned();
 
-        let task = async move {
-            // Wait for the accept loop to terminate
-            let res = accept_task(socket, c_token, c_manager).await;
-            zasyncwrite!(c_listeners).remove(&c_path);
-            res
+            async move {
+                // Wait for the accept loop to terminate
+                let res = accept_task(socket, c_token, manager).await;
+                zasyncwrite!(listeners).remove(&path);
+                res
+            }
         };
         let handle = zenoh_runtime::ZRuntime::Acceptor.spawn(task);
 
@@ -418,6 +431,8 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
         listener.handle.await??;
 
         //Release the lock
+        // @TODO: flock is deprecated and upgrading to new Flock will require some refactoring of this module
+        #[allow(deprecated)]
         let _ = nix::fcntl::flock(listener.lock_fd, nix::fcntl::FlockArg::UnlockNonblock);
         let _ = nix::unistd::close(listener.lock_fd);
         let _ = remove_file(path.clone());

@@ -11,28 +11,64 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::collections::{btree_map, BTreeMap, VecDeque};
-use std::convert::TryInto;
-use std::future::Ready;
-use std::mem::swap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use zenoh::handlers::{locked, DefaultHandler};
-use zenoh::prelude::r#async::*;
-use zenoh::query::{QueryConsolidation, QueryTarget, ReplyKeyExpr};
-use zenoh::subscriber::{Reliability, Subscriber};
-use zenoh::time::Timestamp;
-use zenoh::Result as ZResult;
-use zenoh::SessionRef;
-use zenoh_core::{zlock, AsyncResolve, Resolvable, SyncResolve};
+use std::{
+    collections::{btree_map, BTreeMap, VecDeque},
+    convert::TryInto,
+    future::{IntoFuture, Ready},
+    mem::swap,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use zenoh::{
+    handlers::{locked, Callback, DefaultHandler, IntoHandler},
+    internal::{zerror, zlock},
+    key_expr::KeyExpr,
+    pubsub::Subscriber,
+    query::{QueryConsolidation, QueryTarget, Reply, ReplyKeyExpr, Selector},
+    sample::{Locality, Sample, SampleBuilder},
+    time::Timestamp,
+    Error, Resolvable, Resolve, Result as ZResult, Session, Wait,
+};
+
+/// The space of keys to use in a [`FetchingSubscriber`].
+#[zenoh_macros::unstable]
+pub enum KeySpace {
+    User,
+    Liveliness,
+}
+
+/// The key space for user data.
+#[zenoh_macros::unstable]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct UserSpace;
+
+impl From<UserSpace> for KeySpace {
+    fn from(_: UserSpace) -> Self {
+        KeySpace::User
+    }
+}
+
+/// The key space for liveliness tokens.
+#[zenoh_macros::unstable]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct LivelinessSpace;
+
+impl From<LivelinessSpace> for KeySpace {
+    fn from(_: LivelinessSpace) -> Self {
+        KeySpace::Liveliness
+    }
+}
 
 /// The builder of [`FetchingSubscriber`], allowing to configure it.
-#[must_use = "Resolvables do nothing unless you resolve them using the `res` method from either `SyncResolve` or `AsyncResolve`"]
-pub struct QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler> {
-    pub(crate) session: SessionRef<'a>,
+#[zenoh_macros::unstable]
+#[must_use = "Resolvables do nothing unless you resolve them using `.await` or `zenoh::Wait::wait`"]
+pub struct QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler, const BACKGROUND: bool = false> {
+    pub(crate) session: &'a Session,
     pub(crate) key_expr: ZResult<KeyExpr<'b>>,
     pub(crate) key_space: KeySpace,
-    pub(crate) reliability: Reliability,
     pub(crate) origin: Locality,
     pub(crate) query_selector: Option<ZResult<Selector<'b>>>,
     pub(crate) query_target: QueryTarget,
@@ -45,53 +81,31 @@ pub struct QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler> {
 impl<'a, 'b, KeySpace> QueryingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandler> {
     /// Add callback to [`FetchingSubscriber`].
     #[inline]
-    pub fn callback<Callback>(
+    pub fn callback<F>(
         self,
-        callback: Callback,
-    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Callback>
+        callback: F,
+    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>>
     where
-        Callback: Fn(Sample) + Send + Sync + 'static,
+        F: Fn(Sample) + Send + Sync + 'static,
     {
-        let QueryingSubscriberBuilder {
-            session,
-            key_expr,
-            key_space,
-            reliability,
-            origin,
-            query_selector,
-            query_target,
-            query_consolidation,
-            query_accept_replies,
-            query_timeout,
-            handler: _,
-        } = self;
-        QueryingSubscriberBuilder {
-            session,
-            key_expr,
-            key_space,
-            reliability,
-            origin,
-            query_selector,
-            query_target,
-            query_consolidation,
-            query_accept_replies,
-            query_timeout,
-            handler: callback,
-        }
+        self.with(Callback::new(Arc::new(callback)))
     }
 
     /// Add callback to [`FetchingSubscriber`].
     ///
     /// Using this guarantees that your callback will never be called concurrently.
     /// If your callback is also accepted by the [`callback`](QueryingSubscriberBuilder::callback)
-    /// method, we suggest you use it instead of `callback_mut`
+    /// method, we suggest you use it instead of `callback_mut`.
+    ///
+    /// Subscriber will not be undeclared when dropped, with the callback running
+    /// in background until the session is closed.
     #[inline]
-    pub fn callback_mut<CallbackMut>(
+    pub fn callback_mut<F>(
         self,
-        callback: CallbackMut,
-    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, impl Fn(Sample) + Send + Sync + 'static>
+        callback: F,
+    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>>
     where
-        CallbackMut: FnMut(Sample) + Send + Sync + 'static,
+        F: FnMut(Sample) + Send + Sync + 'static,
     {
         self.callback(locked(callback))
     }
@@ -103,13 +117,12 @@ impl<'a, 'b, KeySpace> QueryingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandle
         handler: Handler,
     ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler>
     where
-        Handler: zenoh::prelude::IntoCallbackReceiverPair<'static, Sample>,
+        Handler: IntoHandler<Sample>,
     {
         let QueryingSubscriberBuilder {
             session,
             key_expr,
             key_space,
-            reliability,
             origin,
             query_selector,
             query_target,
@@ -122,7 +135,6 @@ impl<'a, 'b, KeySpace> QueryingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandle
             session,
             key_expr,
             key_space,
-            reliability,
             origin,
             query_selector,
             query_target,
@@ -134,30 +146,33 @@ impl<'a, 'b, KeySpace> QueryingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandle
     }
 }
 
-impl<'a, 'b, Handler> QueryingSubscriberBuilder<'a, 'b, crate::UserSpace, Handler> {
-    /// Change the subscription reliability.
-    #[inline]
-    pub fn reliability(mut self, reliability: Reliability) -> Self {
-        self.reliability = reliability;
-        self
+impl<'a, 'b, KeySpace> QueryingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>> {
+    /// Register the subscriber callback to be run in background until the session is closed.
+    ///
+    /// Background builder doesn't return a `FetchingSubscriber` object anymore.
+    pub fn background(self) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>, true> {
+        QueryingSubscriberBuilder {
+            session: self.session,
+            key_expr: self.key_expr,
+            key_space: self.key_space,
+            origin: self.origin,
+            query_selector: self.query_selector,
+            query_target: self.query_target,
+            query_consolidation: self.query_consolidation,
+            query_accept_replies: self.query_accept_replies,
+            query_timeout: self.query_timeout,
+            handler: self.handler,
+        }
     }
+}
 
-    /// Change the subscription reliability to Reliable.
-    #[inline]
-    pub fn reliable(mut self) -> Self {
-        self.reliability = Reliability::Reliable;
-        self
-    }
-
-    /// Change the subscription reliability to BestEffort.
-    #[inline]
-    pub fn best_effort(mut self) -> Self {
-        self.reliability = Reliability::BestEffort;
-        self
-    }
-
+impl<'b, Handler, const BACKGROUND: bool>
+    QueryingSubscriberBuilder<'_, 'b, UserSpace, Handler, BACKGROUND>
+{
+    ///
+    ///
     /// Restrict the matching publications that will be receive by this [`Subscriber`]
-    /// to the ones that have the given [`Locality`](zenoh::prelude::Locality).
+    /// to the ones that have the given [`Locality`](Locality).
     #[zenoh_macros::unstable]
     #[inline]
     pub fn allowed_origin(mut self, origin: Locality) -> Self {
@@ -170,7 +185,7 @@ impl<'a, 'b, Handler> QueryingSubscriberBuilder<'a, 'b, crate::UserSpace, Handle
     pub fn query_selector<IntoSelector>(mut self, query_selector: IntoSelector) -> Self
     where
         IntoSelector: TryInto<Selector<'b>>,
-        <IntoSelector as TryInto<Selector<'b>>>::Error: Into<zenoh_result::Error>,
+        <IntoSelector as TryInto<Selector<'b>>>::Error: Into<Error>,
     {
         self.query_selector = Some(query_selector.try_into().map_err(Into::into));
         self
@@ -201,49 +216,53 @@ impl<'a, 'b, Handler> QueryingSubscriberBuilder<'a, 'b, crate::UserSpace, Handle
     }
 }
 
-impl<'a, 'b, KeySpace, Handler> QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler> {
+impl<'a, 'b, KeySpace, Handler, const BACKGROUND: bool>
+    QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler, BACKGROUND>
+{
     /// Change the timeout to be used for queries.
     #[inline]
     pub fn query_timeout(mut self, query_timeout: Duration) -> Self {
         self.query_timeout = query_timeout;
         self
     }
-}
 
-impl<'a, KeySpace, Handler> Resolvable for QueryingSubscriberBuilder<'a, '_, KeySpace, Handler>
-where
-    Handler: IntoCallbackReceiverPair<'static, Sample>,
-    Handler::Receiver: Send,
-{
-    type To = ZResult<FetchingSubscriber<'a, Handler::Receiver>>;
-}
-
-impl<KeySpace, Handler> SyncResolve for QueryingSubscriberBuilder<'_, '_, KeySpace, Handler>
-where
-    KeySpace: Into<crate::KeySpace> + Clone,
-    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
-    Handler::Receiver: Send,
-{
-    fn res_sync(self) -> <Self as Resolvable>::To {
+    #[allow(clippy::type_complexity)]
+    fn into_fetching_subscriber_builder(
+        self,
+    ) -> ZResult<
+        FetchingSubscriberBuilder<
+            'a,
+            'b,
+            KeySpace,
+            Handler,
+            impl FnOnce(Box<dyn Fn(Reply) + Send + Sync>) -> ZResult<()>,
+            Reply,
+            BACKGROUND,
+        >,
+    >
+    where
+        KeySpace: Into<self::KeySpace> + Clone,
+        Handler: IntoHandler<Sample>,
+        Handler::Handler: Send,
+    {
         let session = self.session.clone();
-        let key_expr = self.key_expr?;
+        let key_expr = self.key_expr?.into_owned();
         let key_space = self.key_space.clone().into();
         let query_selector = match self.query_selector {
-            Some(s) => Some(s?),
+            Some(s) => Some(s?.into_owned()),
             None => None,
         };
         let query_target = self.query_target;
         let query_consolidation = self.query_consolidation;
         let query_accept_replies = self.query_accept_replies;
         let query_timeout = self.query_timeout;
-        FetchingSubscriberBuilder {
+        Ok(FetchingSubscriberBuilder {
             session: self.session,
             key_expr: Ok(key_expr.clone()),
             key_space: self.key_space,
-            reliability: self.reliability,
             origin: self.origin,
-            fetch: |cb| match key_space {
-                crate::KeySpace::User => match query_selector {
+            fetch: move |cb| match key_space {
+                self::KeySpace::User => match query_selector {
                     Some(s) => session.get(s),
                     None => session.get(key_expr),
                 }
@@ -252,31 +271,75 @@ where
                 .consolidation(query_consolidation)
                 .accept_replies(query_accept_replies)
                 .timeout(query_timeout)
-                .res_sync(),
-                crate::KeySpace::Liveliness => session
+                .wait(),
+                self::KeySpace::Liveliness => session
                     .liveliness()
                     .get(key_expr)
                     .callback(cb)
                     .timeout(query_timeout)
-                    .res_sync(),
+                    .wait(),
             },
             handler: self.handler,
             phantom: std::marker::PhantomData,
-        }
-        .res_sync()
+        })
     }
 }
 
-impl<'a, KeySpace, Handler> AsyncResolve for QueryingSubscriberBuilder<'a, '_, KeySpace, Handler>
+impl<KeySpace, Handler> Resolvable for QueryingSubscriberBuilder<'_, '_, KeySpace, Handler>
 where
-    KeySpace: Into<crate::KeySpace> + Clone,
-    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
-    Handler::Receiver: Send,
+    Handler: IntoHandler<Sample>,
+    Handler::Handler: Send,
 {
-    type Future = Ready<Self::To>;
+    type To = ZResult<FetchingSubscriber<Handler::Handler>>;
+}
 
-    fn res_async(self) -> Self::Future {
-        std::future::ready(self.res_sync())
+impl<KeySpace, Handler> Wait for QueryingSubscriberBuilder<'_, '_, KeySpace, Handler>
+where
+    KeySpace: Into<self::KeySpace> + Clone,
+    Handler: IntoHandler<Sample> + Send,
+    Handler::Handler: Send,
+{
+    fn wait(self) -> <Self as Resolvable>::To {
+        self.into_fetching_subscriber_builder()?.wait()
+    }
+}
+
+impl<KeySpace, Handler> IntoFuture for QueryingSubscriberBuilder<'_, '_, KeySpace, Handler>
+where
+    KeySpace: Into<self::KeySpace> + Clone,
+    Handler: IntoHandler<Sample> + Send,
+    Handler::Handler: Send,
+{
+    type Output = <Self as Resolvable>::To;
+    type IntoFuture = Ready<<Self as Resolvable>::To>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        std::future::ready(self.wait())
+    }
+}
+
+impl<KeySpace> Resolvable for QueryingSubscriberBuilder<'_, '_, KeySpace, Callback<Sample>, true> {
+    type To = ZResult<()>;
+}
+
+impl<KeySpace> Wait for QueryingSubscriberBuilder<'_, '_, KeySpace, Callback<Sample>, true>
+where
+    KeySpace: Into<self::KeySpace> + Clone,
+{
+    fn wait(self) -> <Self as Resolvable>::To {
+        self.into_fetching_subscriber_builder()?.wait()
+    }
+}
+
+impl<KeySpace> IntoFuture for QueryingSubscriberBuilder<'_, '_, KeySpace, Callback<Sample>, true>
+where
+    KeySpace: Into<self::KeySpace> + Clone,
+{
+    type Output = <Self as Resolvable>::To;
+    type IntoFuture = Ready<<Self as Resolvable>::To>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        std::future::ready(self.wait())
     }
 }
 
@@ -302,8 +365,8 @@ impl MergeQueue {
     }
 
     fn push(&mut self, sample: Sample) {
-        if let Some(ts) = sample.timestamp {
-            self.timstamped.entry(ts).or_insert(sample);
+        if let Some(ts) = sample.timestamp() {
+            self.timstamped.entry(*ts).or_insert(sample);
         } else {
             self.untimestamped.push_back(sample);
         }
@@ -341,7 +404,8 @@ struct InnerState {
 }
 
 /// The builder of [`FetchingSubscriber`], allowing to configure it.
-#[must_use = "Resolvables do nothing unless you resolve them using the `res` method from either `SyncResolve` or `AsyncResolve`"]
+#[zenoh_macros::unstable]
+#[must_use = "Resolvables do nothing unless you resolve them using `.await` or `zenoh::Wait::wait`"]
 pub struct FetchingSubscriberBuilder<
     'a,
     'b,
@@ -349,14 +413,13 @@ pub struct FetchingSubscriberBuilder<
     Handler,
     Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
     TryIntoSample,
+    const BACKGROUND: bool = false,
 > where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
-    pub(crate) session: SessionRef<'a>,
+    pub(crate) session: &'a Session,
     pub(crate) key_expr: ZResult<KeyExpr<'b>>,
     pub(crate) key_space: KeySpace,
-    pub(crate) reliability: Reliability,
     pub(crate) origin: Locality,
     pub(crate) fetch: Fetch,
     pub(crate) handler: Handler,
@@ -365,15 +428,14 @@ pub struct FetchingSubscriberBuilder<
 
 impl<
         'a,
-        'b,
         KeySpace,
         Handler,
         Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
         TryIntoSample,
-    > FetchingSubscriberBuilder<'a, 'b, KeySpace, Handler, Fetch, TryIntoSample>
+        const BACKGROUND: bool,
+    > FetchingSubscriberBuilder<'a, '_, KeySpace, Handler, Fetch, TryIntoSample, BACKGROUND>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
     fn with_static_keys(
         self,
@@ -382,7 +444,6 @@ where
             session: self.session,
             key_expr: self.key_expr.map(|s| s.into_owned()),
             key_space: self.key_space,
-            reliability: self.reliability,
             origin: self.origin,
             fetch: self.fetch,
             handler: self.handler,
@@ -399,59 +460,35 @@ impl<
         TryIntoSample,
     > FetchingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandler, Fetch, TryIntoSample>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
     /// Add callback to [`FetchingSubscriber`].
     #[inline]
-    pub fn callback<Callback>(
+    pub fn callback<F>(
         self,
-        callback: Callback,
-    ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Callback, Fetch, TryIntoSample>
+        callback: F,
+    ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>, Fetch, TryIntoSample>
     where
-        Callback: Fn(Sample) + Send + Sync + 'static,
+        F: Fn(Sample) + Send + Sync + 'static,
     {
-        let FetchingSubscriberBuilder {
-            session,
-            key_expr,
-            key_space,
-            reliability,
-            origin,
-            fetch,
-            handler: _,
-            phantom,
-        } = self;
-        FetchingSubscriberBuilder {
-            session,
-            key_expr,
-            key_space,
-            reliability,
-            origin,
-            fetch,
-            handler: callback,
-            phantom,
-        }
+        self.with(Callback::new(Arc::new(callback)))
     }
 
     /// Add callback to [`FetchingSubscriber`].
     ///
     /// Using this guarantees that your callback will never be called concurrently.
     /// If your callback is also accepted by the [`callback`](FetchingSubscriberBuilder::callback)
-    /// method, we suggest you use it instead of `callback_mut`
+    /// method, we suggest you use it instead of `callback_mut`.
+    ///
+    /// Subscriber will not be undeclared when dropped, with the callback running
+    /// in background until the session is closed.
     #[inline]
-    pub fn callback_mut<CallbackMut>(
+    pub fn callback_mut<F>(
         self,
-        callback: CallbackMut,
-    ) -> FetchingSubscriberBuilder<
-        'a,
-        'b,
-        KeySpace,
-        impl Fn(Sample) + Send + Sync + 'static,
-        Fetch,
-        TryIntoSample,
-    >
+        callback: F,
+    ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>, Fetch, TryIntoSample>
     where
-        CallbackMut: FnMut(Sample) + Send + Sync + 'static,
+        F: FnMut(Sample) + Send + Sync + 'static,
     {
         self.callback(locked(callback))
     }
@@ -463,13 +500,12 @@ where
         handler: Handler,
     ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Handler, Fetch, TryIntoSample>
     where
-        Handler: zenoh::prelude::IntoCallbackReceiverPair<'static, Sample>,
+        Handler: IntoHandler<Sample>,
     {
         let FetchingSubscriberBuilder {
             session,
             key_expr,
             key_space,
-            reliability,
             origin,
             fetch,
             handler: _,
@@ -479,7 +515,6 @@ where
             session,
             key_expr,
             key_space,
-            reliability,
             origin,
             fetch,
             handler,
@@ -491,37 +526,43 @@ where
 impl<
         'a,
         'b,
+        KeySpace,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+        TryIntoSample,
+    > FetchingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>, Fetch, TryIntoSample>
+where
+    TryIntoSample: ExtractSample,
+{
+    /// Register the subscriber callback to be run in background until the session is closed.
+    ///
+    /// Background builder doesn't return a `FetchingSubscriber` object anymore.
+    pub fn background(
+        self,
+    ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Callback<Sample>, Fetch, TryIntoSample, true>
+    {
+        FetchingSubscriberBuilder {
+            session: self.session,
+            key_expr: self.key_expr,
+            key_space: self.key_space,
+            origin: self.origin,
+            fetch: self.fetch,
+            handler: self.handler,
+            phantom: self.phantom,
+        }
+    }
+}
+
+impl<
         Handler,
         Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
         TryIntoSample,
-    > FetchingSubscriberBuilder<'a, 'b, crate::UserSpace, Handler, Fetch, TryIntoSample>
+        const BACKGROUND: bool,
+    > FetchingSubscriberBuilder<'_, '_, UserSpace, Handler, Fetch, TryIntoSample, BACKGROUND>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
-    /// Change the subscription reliability.
-    #[inline]
-    pub fn reliability(mut self, reliability: Reliability) -> Self {
-        self.reliability = reliability;
-        self
-    }
-
-    /// Change the subscription reliability to Reliable.
-    #[inline]
-    pub fn reliable(mut self) -> Self {
-        self.reliability = Reliability::Reliable;
-        self
-    }
-
-    /// Change the subscription reliability to BestEffort.
-    #[inline]
-    pub fn best_effort(mut self) -> Self {
-        self.reliability = Reliability::BestEffort;
-        self
-    }
-
-    /// Restrict the matching publications that will be receive by this [`FetchingSubscriber`]
-    /// to the ones that have the given [`Locality`](zenoh::prelude::Locality).
+    /// Restrict the matching publications that will be received by this [`FetchingSubscriber`]
+    /// to the ones that have the given [`Locality`](Locality).
     #[zenoh_macros::unstable]
     #[inline]
     pub fn allowed_origin(mut self, origin: Locality) -> Self {
@@ -531,19 +572,17 @@ where
 }
 
 impl<
-        'a,
         KeySpace,
         Handler,
         Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
         TryIntoSample,
-    > Resolvable for FetchingSubscriberBuilder<'a, '_, KeySpace, Handler, Fetch, TryIntoSample>
+    > Resolvable for FetchingSubscriberBuilder<'_, '_, KeySpace, Handler, Fetch, TryIntoSample>
 where
-    Handler: IntoCallbackReceiverPair<'static, Sample>,
-    Handler::Receiver: Send,
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    Handler: IntoHandler<Sample>,
+    Handler::Handler: Send,
+    TryIntoSample: ExtractSample,
 {
-    type To = ZResult<FetchingSubscriber<'a, Handler::Receiver>>;
+    type To = ZResult<FetchingSubscriber<Handler::Handler>>;
 }
 
 impl<
@@ -551,37 +590,83 @@ impl<
         Handler,
         Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
         TryIntoSample,
-    > SyncResolve for FetchingSubscriberBuilder<'_, '_, KeySpace, Handler, Fetch, TryIntoSample>
+    > Wait for FetchingSubscriberBuilder<'_, '_, KeySpace, Handler, Fetch, TryIntoSample>
 where
-    KeySpace: Into<crate::KeySpace>,
-    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
-    Handler::Receiver: Send,
-    TryIntoSample: TryInto<Sample> + Send + Sync,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    KeySpace: Into<self::KeySpace>,
+    Handler: IntoHandler<Sample> + Send,
+    Handler::Handler: Send,
+    TryIntoSample: ExtractSample + Send + Sync,
 {
-    fn res_sync(self) -> <Self as Resolvable>::To {
+    fn wait(self) -> <Self as Resolvable>::To {
         FetchingSubscriber::new(self.with_static_keys())
     }
 }
 
 impl<
-        'a,
         KeySpace,
         Handler,
         Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
         TryIntoSample,
-    > AsyncResolve for FetchingSubscriberBuilder<'a, '_, KeySpace, Handler, Fetch, TryIntoSample>
+    > IntoFuture for FetchingSubscriberBuilder<'_, '_, KeySpace, Handler, Fetch, TryIntoSample>
 where
-    KeySpace: Into<crate::KeySpace>,
-    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
-    Handler::Receiver: Send,
-    TryIntoSample: TryInto<Sample> + Send + Sync,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    KeySpace: Into<self::KeySpace>,
+    Handler: IntoHandler<Sample> + Send,
+    Handler::Handler: Send,
+    TryIntoSample: ExtractSample + Send + Sync,
 {
-    type Future = Ready<Self::To>;
+    type Output = <Self as Resolvable>::To;
+    type IntoFuture = Ready<<Self as Resolvable>::To>;
 
-    fn res_async(self) -> Self::Future {
-        std::future::ready(self.res_sync())
+    fn into_future(self) -> Self::IntoFuture {
+        std::future::ready(self.wait())
+    }
+}
+
+impl<
+        KeySpace,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+        TryIntoSample,
+    > Resolvable
+    for FetchingSubscriberBuilder<'_, '_, KeySpace, Callback<Sample>, Fetch, TryIntoSample, true>
+where
+    TryIntoSample: ExtractSample,
+{
+    type To = ZResult<()>;
+}
+
+impl<
+        KeySpace,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
+        TryIntoSample,
+    > Wait
+    for FetchingSubscriberBuilder<'_, '_, KeySpace, Callback<Sample>, Fetch, TryIntoSample, true>
+where
+    KeySpace: Into<self::KeySpace>,
+    TryIntoSample: ExtractSample + Send + Sync,
+{
+    fn wait(self) -> <Self as Resolvable>::To {
+        FetchingSubscriber::new(self.with_static_keys())?
+            .subscriber
+            .set_background(true);
+        Ok(())
+    }
+}
+
+impl<
+        KeySpace,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
+        TryIntoSample,
+    > IntoFuture
+    for FetchingSubscriberBuilder<'_, '_, KeySpace, Callback<Sample>, Fetch, TryIntoSample, true>
+where
+    KeySpace: Into<self::KeySpace>,
+    TryIntoSample: ExtractSample + Send + Sync,
+{
+    type Output = <Self as Resolvable>::To;
+    type IntoFuture = Ready<<Self as Resolvable>::To>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        std::future::ready(self.wait())
     }
 }
 
@@ -597,20 +682,18 @@ where
 /// ```no_run
 /// # #[tokio::main]
 /// # async fn main() {
-/// use zenoh::prelude::r#async::*;
+/// use zenoh::Wait;
 /// use zenoh_ext::*;
 ///
-/// let session = zenoh::open(config::peer()).res().await.unwrap();
+/// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
 /// let subscriber = session
 ///     .declare_subscriber("key/expr")
 ///     .fetching( |cb| {
-///         use zenoh::prelude::sync::SyncResolve;
 ///         session
 ///             .get("key/expr")
 ///             .callback(cb)
-///             .res_sync()
+///             .wait()
 ///     })
-///     .res()
 ///     .await
 ///     .unwrap();
 /// while let Ok(sample) = subscriber.recv_async().await {
@@ -618,62 +701,72 @@ where
 /// }
 /// # }
 /// ```
-pub struct FetchingSubscriber<'a, Receiver> {
-    subscriber: Subscriber<'a, ()>,
-    callback: Arc<dyn Fn(Sample) + Send + Sync + 'static>,
+#[zenoh_macros::unstable]
+pub struct FetchingSubscriber<Handler> {
+    subscriber: Subscriber<()>,
+    callback: Callback<Sample>,
     state: Arc<Mutex<InnerState>>,
-    receiver: Receiver,
+    handler: Handler,
 }
 
-impl<Receiver> std::ops::Deref for FetchingSubscriber<'_, Receiver> {
-    type Target = Receiver;
+impl<Handler> std::ops::Deref for FetchingSubscriber<Handler> {
+    type Target = Handler;
     fn deref(&self) -> &Self::Target {
-        &self.receiver
+        &self.handler
     }
 }
 
-impl<Receiver> std::ops::DerefMut for FetchingSubscriber<'_, Receiver> {
+impl<Handler> std::ops::DerefMut for FetchingSubscriber<Handler> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.receiver
+        &mut self.handler
     }
 }
 
-impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
+impl<Handler> FetchingSubscriber<Handler> {
     fn new<
+        'a,
         KeySpace,
-        Handler,
+        InputHandler,
         Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
         TryIntoSample,
     >(
-        conf: FetchingSubscriberBuilder<'a, 'a, KeySpace, Handler, Fetch, TryIntoSample>,
+        conf: FetchingSubscriberBuilder<'a, 'a, KeySpace, InputHandler, Fetch, TryIntoSample>,
     ) -> ZResult<Self>
     where
-        KeySpace: Into<crate::KeySpace>,
-        Handler: IntoCallbackReceiverPair<'static, Sample, Receiver = Receiver> + Send,
-        TryIntoSample: TryInto<Sample> + Send + Sync,
-        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+        KeySpace: Into<self::KeySpace>,
+        InputHandler: IntoHandler<Sample, Handler = Handler> + Send,
+        TryIntoSample: ExtractSample + Send + Sync,
     {
+        let session_id = conf.session.zid();
+
         let state = Arc::new(Mutex::new(InnerState {
             pending_fetches: 0,
             merge_queue: MergeQueue::new(),
         }));
-        let (callback, receiver) = conf.handler.into_cb_receiver_pair();
+        let (callback, receiver) = conf.handler.into_handler();
 
         let sub_callback = {
             let state = state.clone();
             let callback = callback.clone();
-            move |mut s| {
+            move |s| {
                 let state = &mut zlock!(state);
                 if state.pending_fetches == 0 {
-                    callback(s);
+                    callback.call(s);
                 } else {
                     tracing::trace!(
                         "Sample received while fetch in progress: push it to merge_queue"
                     );
+
                     // ensure the sample has a timestamp, thus it will always be sorted into the MergeQueue
                     // after any timestamped Sample possibly coming from a fetch reply.
-                    s.ensure_timestamp();
-                    state.merge_queue.push(s);
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().into(); // UNIX_EPOCH is Returns a Timespec::zero(), Unwrap Should be permissable here
+                    let timestamp = s
+                        .timestamp()
+                        .cloned()
+                        .unwrap_or(Timestamp::new(now, session_id.into()));
+                    state
+                        .merge_queue
+                        .push(SampleBuilder::from(s).timestamp(timestamp).into());
                 }
             }
         };
@@ -684,26 +777,25 @@ impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
         let handler = register_handler(state.clone(), callback.clone());
         // declare subscriber
         let subscriber = match conf.key_space.into() {
-            crate::KeySpace::User => conf
+            self::KeySpace::User => conf
                 .session
                 .declare_subscriber(&key_expr)
                 .callback(sub_callback)
-                .reliability(conf.reliability)
                 .allowed_origin(conf.origin)
-                .res_sync()?,
-            crate::KeySpace::Liveliness => conf
+                .wait()?,
+            self::KeySpace::Liveliness => conf
                 .session
                 .liveliness()
                 .declare_subscriber(&key_expr)
                 .callback(sub_callback)
-                .res_sync()?,
+                .wait()?,
         };
 
         let fetch_subscriber = FetchingSubscriber {
             subscriber,
             callback,
             state,
-            receiver,
+            handler: receiver,
         };
 
         // run fetch
@@ -712,10 +804,15 @@ impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
         Ok(fetch_subscriber)
     }
 
-    /// Close this FetchingSubscriber
+    /// Undeclare this [`FetchingSubscriber`]`.
     #[inline]
-    pub fn close(self) -> impl Resolve<ZResult<()>> + 'a {
+    pub fn undeclare(self) -> impl Resolve<ZResult<()>> {
         self.subscriber.undeclare()
+    }
+
+    #[zenoh_macros::internal]
+    pub fn set_background(&mut self, background: bool) {
+        self.subscriber.set_background(background)
     }
 
     /// Return the key expression of this FetchingSubscriber
@@ -733,33 +830,29 @@ impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
+    /// use zenoh::Wait;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let mut subscriber = session
     ///     .declare_subscriber("key/expr")
     ///     .fetching( |cb| {
-    ///         use zenoh::prelude::sync::SyncResolve;
     ///         session
     ///             .get("key/expr")
     ///             .callback(cb)
-    ///             .res_sync()
+    ///             .wait()
     ///     })
-    ///     .res()
     ///     .await
     ///     .unwrap();
     ///
     /// // perform an additional fetch
     /// subscriber
     ///     .fetch( |cb| {
-    ///         use zenoh::prelude::sync::SyncResolve;
     ///         session
     ///             .get("key/expr")
     ///             .callback(cb)
-    ///             .res_sync()
+    ///             .wait()
     ///     })
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// # }
@@ -773,8 +866,7 @@ impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
         fetch: Fetch,
     ) -> impl Resolve<ZResult<()>>
     where
-        TryIntoSample: TryInto<Sample> + Send + Sync,
-        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+        TryIntoSample: ExtractSample + Send + Sync,
     {
         FetchBuilder {
             fetch,
@@ -787,7 +879,7 @@ impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
 
 struct RepliesHandler {
     state: Arc<Mutex<InnerState>>,
-    callback: Arc<dyn Fn(Sample) + Send + Sync>,
+    callback: Callback<Sample>,
 }
 
 impl Drop for RepliesHandler {
@@ -804,7 +896,7 @@ impl Drop for RepliesHandler {
                 state.merge_queue.len()
             );
             for s in state.merge_queue.drain() {
-                (self.callback)(s);
+                self.callback.call(s);
             }
         }
     }
@@ -816,88 +908,79 @@ impl Drop for RepliesHandler {
 /// ```no_run
 /// # #[tokio::main]
 /// # async fn main() {
-/// # use zenoh::prelude::r#async::*;
+/// # use zenoh::Wait;
 /// # use zenoh_ext::*;
 /// #
-/// # let session = zenoh::open(config::peer()).res().await.unwrap();
+/// # let session = zenoh::open(zenoh::Config::default()).await.unwrap();
 /// # let mut fetching_subscriber = session
 /// #     .declare_subscriber("key/expr")
 /// #     .fetching( |cb| {
-/// #         use zenoh::prelude::sync::SyncResolve;
 /// #         session
 /// #             .get("key/expr")
 /// #             .callback(cb)
-/// #            .res_sync()
+/// #            .wait()
 /// #     })
-/// #     .res()
 /// #     .await
 /// #     .unwrap();
 /// #
 /// fetching_subscriber
 ///     .fetch( |cb| {
-///         use zenoh::prelude::sync::SyncResolve;
 ///         session
 ///             .get("key/expr")
 ///             .callback(cb)
-///             .res_sync()
+///             .wait()
 ///     })
-///     .res()
 ///     .await
 ///     .unwrap();
 /// # }
 /// ```
-#[must_use = "Resolvables do nothing unless you resolve them using the `res` method from either `SyncResolve` or `AsyncResolve`"]
+#[zenoh_macros::unstable]
+#[must_use = "Resolvables do nothing unless you resolve them using `.await` or `zenoh::Wait::wait`"]
 pub struct FetchBuilder<
     Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
     TryIntoSample,
 > where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
     fetch: Fetch,
     phantom: std::marker::PhantomData<TryIntoSample>,
     state: Arc<Mutex<InnerState>>,
-    callback: Arc<dyn Fn(Sample) + Send + Sync>,
+    callback: Callback<Sample>,
 }
 
 impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample>
     Resolvable for FetchBuilder<Fetch, TryIntoSample>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
     type To = ZResult<()>;
 }
 
-impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample>
-    SyncResolve for FetchBuilder<Fetch, TryIntoSample>
+impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample> Wait
+    for FetchBuilder<Fetch, TryIntoSample>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
-    fn res_sync(self) -> <Self as Resolvable>::To {
+    fn wait(self) -> <Self as Resolvable>::To {
         let handler = register_handler(self.state, self.callback);
         run_fetch(self.fetch, handler)
     }
 }
 
 impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample>
-    AsyncResolve for FetchBuilder<Fetch, TryIntoSample>
+    IntoFuture for FetchBuilder<Fetch, TryIntoSample>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
-    type Future = Ready<Self::To>;
+    type Output = <Self as Resolvable>::To;
+    type IntoFuture = Ready<<Self as Resolvable>::To>;
 
-    fn res_async(self) -> Self::Future {
-        std::future::ready(self.res_sync())
+    fn into_future(self) -> Self::IntoFuture {
+        std::future::ready(self.wait())
     }
 }
 
-fn register_handler(
-    state: Arc<Mutex<InnerState>>,
-    callback: Arc<dyn Fn(Sample) + Send + Sync>,
-) -> RepliesHandler {
+fn register_handler(state: Arc<Mutex<InnerState>>, callback: Callback<Sample>) -> RepliesHandler {
     zlock!(state).pending_fetches += 1;
     // pending fetches will be decremented in RepliesHandler drop()
     RepliesHandler { state, callback }
@@ -911,16 +994,26 @@ fn run_fetch<
     handler: RepliesHandler,
 ) -> ZResult<()>
 where
-    TryIntoSample: TryInto<Sample>,
-    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    TryIntoSample: ExtractSample,
 {
     tracing::debug!("Fetch data for FetchingSubscriber");
-    (fetch)(Box::new(move |s: TryIntoSample| match s.try_into() {
+    (fetch)(Box::new(move |s: TryIntoSample| match s.extract() {
         Ok(s) => {
             let mut state = zlock!(handler.state);
             tracing::trace!("Fetched sample received: push it to merge_queue");
             state.merge_queue.push(s);
         }
-        Err(e) => tracing::debug!("Received error fetching data: {}", e.into()),
+        Err(e) => tracing::debug!("Received error fetching data: {}", e),
     }))
+}
+
+#[zenoh_macros::unstable]
+pub trait ExtractSample {
+    fn extract(self) -> ZResult<Sample>;
+}
+
+impl ExtractSample for Reply {
+    fn extract(self) -> ZResult<Sample> {
+        self.into_result().map_err(|e| zerror!("{:?}", e).into())
+    }
 }

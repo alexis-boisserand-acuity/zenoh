@@ -13,26 +13,26 @@
 //
 
 //! To manage groups and group memberships
+use std::{
+    collections::HashMap,
+    convert::TryInto,
+    ops::Add,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use flume::{Receiver, Sender};
-use futures::prelude::*;
-use futures::select;
+use futures::{prelude::*, select};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::convert::TryInto;
-use std::ops::Add;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use zenoh::prelude::r#async::*;
-use zenoh::publication::Publisher;
-use zenoh::query::ConsolidationMode;
-use zenoh::Error as ZError;
-use zenoh::Result as ZResult;
-use zenoh::Session;
-use zenoh_result::bail;
-use zenoh_sync::Condition;
-use zenoh_task::TaskController;
+use zenoh::{
+    bytes::ZBytesReader,
+    internal::{bail, Condition, TaskController},
+    key_expr::{keyexpr, KeyExpr, OwnedKeyExpr},
+    pubsub::Publisher,
+    qos::Priority,
+    Error as ZError, Result as ZResult, Session,
+};
 
 const GROUP_PREFIX: &str = "zenoh/ext/net/group";
 const EVENT_POSTFIX: &str = "evt";
@@ -40,31 +40,37 @@ const VIEW_REFRESH_LEASE_RATIO: f32 = 0.75f32;
 const DEFAULT_LEASE: Duration = Duration::from_secs(18);
 const DEFAULT_PRIORITY: Priority = Priority::DataHigh;
 
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct JoinEvent {
     pub member: Member,
 }
 
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LeaseExpiredEvent {
     pub mid: OwnedKeyExpr,
 }
 
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LeaveEvent {
     pub mid: OwnedKeyExpr,
 }
 
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NewLeaderEvent {
     pub mid: OwnedKeyExpr,
 }
 
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Debug)]
 struct KeepAliveEvent {
     pub mid: OwnedKeyExpr,
 }
 
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Debug)]
 enum GroupNetEvent {
     Join(JoinEvent),
@@ -74,6 +80,7 @@ enum GroupNetEvent {
 
 /// Events exposed to the user to be informed for relevant
 /// changes in the group.
+#[zenoh_macros::unstable]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum GroupEvent {
     Join(JoinEvent),
@@ -83,12 +90,14 @@ pub enum GroupEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[zenoh_macros::unstable]
 pub enum MemberLiveliness {
     Auto,
     Manual,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[zenoh_macros::unstable]
 pub struct Member {
     mid: OwnedKeyExpr,
     info: Option<String>,
@@ -161,6 +170,7 @@ struct GroupState {
     cond: Condition,
 }
 
+#[zenoh_macros::unstable]
 pub struct Group {
     state: Arc<GroupState>,
     task_controller: TaskController,
@@ -184,7 +194,7 @@ async fn keep_alive_task(state: Arc<GroupState>) {
     loop {
         tokio::time::sleep(period).await;
         tracing::trace!("Sending Keep Alive for: {}", &state.local_member.mid);
-        let _ = state.group_publisher.put(buf.clone()).res().await;
+        let _ = state.group_publisher.put(buf.clone()).await;
     }
 }
 
@@ -226,26 +236,21 @@ async fn query_handler(z: Arc<Session>, state: Arc<GroupState>) {
     .unwrap();
     tracing::debug!("Started query handler for: {}", &qres);
     let buf = bincode::serialize(&state.local_member).unwrap();
-    let queryable = z.declare_queryable(&qres).res().await.unwrap();
+    let queryable = z.declare_queryable(&qres).await.unwrap();
 
     while let Ok(query) = queryable.recv_async().await {
         tracing::trace!("Serving query for: {}", &qres);
-        query
-            .reply(Ok(Sample::new(qres.clone(), buf.clone())))
-            .res()
-            .await
-            .unwrap();
+        query.reply(qres.clone(), buf.clone()).await.unwrap();
     }
 }
 
 async fn net_event_handler(z: Arc<Session>, state: Arc<GroupState>) {
     let sub = z
         .declare_subscriber(state.group_publisher.key_expr())
-        .res()
         .await
         .unwrap();
     while let Ok(s) = sub.recv_async().await {
-        match bincode::deserialize::<GroupNetEvent>(&(s.value.payload.contiguous())) {
+        match bincode::deserialize_from::<ZBytesReader, GroupNetEvent>(s.payload().reader()) {
             Ok(evt) => match evt {
                 GroupNetEvent::Join(je) => {
                     tracing::debug!("Member join: {:?}", &je.member);
@@ -297,15 +302,15 @@ async fn net_event_handler(z: Arc<Session>, state: Arc<GroupState>) {
                                 );
                                 let qres = format!("{}/{}/{}", GROUP_PREFIX, &state.gid, kae.mid);
                                 // @TODO: we could also send this member info
-                                let qc = ConsolidationMode::None;
+                                let qc = zenoh::query::ConsolidationMode::None;
                                 tracing::trace!("Issuing Query for {}", &qres);
-                                let receiver = z.get(&qres).consolidation(qc).res().await.unwrap();
+                                let receiver = z.get(&qres).consolidation(qc).await.unwrap();
 
                                 while let Ok(reply) = receiver.recv_async().await {
-                                    match reply.sample {
+                                    match reply.result() {
                                         Ok(sample) => {
-                                            match bincode::deserialize::<Member>(
-                                                &sample.payload.contiguous(),
+                                            match bincode::deserialize_from::<ZBytesReader, Member>(
+                                                sample.payload().reader(),
                                             ) {
                                                 Ok(m) => {
                                                     let mut expiry = Instant::now();
@@ -335,7 +340,7 @@ async fn net_event_handler(z: Arc<Session>, state: Arc<GroupState>) {
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::warn!("Error received: {}", e);
+                                            tracing::warn!("Error received: {:?}", e);
                                         }
                                     }
                                 }
@@ -369,7 +374,6 @@ impl Group {
         let publisher = z
             .declare_publisher(event_expr)
             .priority(with.priority)
-            .res()
             .await
             .unwrap();
         let state = Arc::new(GroupState {
@@ -386,7 +390,7 @@ impl Group {
         tracing::debug!("Sending Join Message for local member: {:?}", &with);
         let join_evt = GroupNetEvent::Join(JoinEvent { member: with });
         let buf = bincode::serialize(&join_evt).unwrap();
-        let _ = state.group_publisher.put(buf).res().await;
+        let _ = state.group_publisher.put(buf).await;
 
         let task_controller = TaskController::default();
         // If the liveliness is manual it is the user who has to assert it.

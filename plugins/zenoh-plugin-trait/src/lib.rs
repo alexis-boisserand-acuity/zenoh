@@ -14,9 +14,11 @@
 
 //! # The plugin infrastructure for Zenoh.
 //!
+//! <div class="warning" style="background-color:#fff5d6;">This API has been marked as <strong>unstable</strong>: it works as advertised, but it may be changed in a future release.</div>
+//!
 //! To build a plugin, implement [`Plugin`].
 //!
-//! If building a plugin for [`zenohd`](https://crates.io/crates/zenoh), you should use the types exported in [`zenoh::plugins`](https://docs.rs/zenoh/latest/zenoh/plugins) to fill [`Plugin`]'s associated types.  
+//! If building a plugin for [`zenohd`](https://crates.io/crates/zenoh), you should use the types exported in [`zenoh::plugins`](https://docs.rs/zenoh/latest/zenoh/plugins) to fill [`Plugin`]'s associated types.
 //! To check your plugin typing for `zenohd`, have your plugin implement [`zenoh::plugins::ZenohPlugin`](https://docs.rs/zenoh/latest/zenoh/plugins/struct.ZenohPlugin)
 //!
 //! Plugin is a struct which implements the [`Plugin`] trait. This trait has two associated types:
@@ -25,13 +27,13 @@
 //!
 //! The actual work of the plugin is performed by the instance, which is created by the [`start`](Plugin::start) function.
 //!
-//! Plugins are loaded, started and stopped by [`PluginsManager`](crate::manager::PluginsManager). Stopping plugin is just dropping it's instance.
+//! Plugins are loaded, started and stopped by [`PluginsManager`]. Stopping plugin is just dropping it's instance.
 //!
 //! Plugins can be static and dynamic.
 //!
-//! Static plugin is just a type which implements [`Plugin`] trait. It can be added to [`PluginsManager`](crate::manager::PluginsManager) by [`PluginsManager::add_static_plugin`](crate::manager::PluginsManager::add_static_plugin) method.
+//! Static plugin is just a type which implements [`Plugin`] trait. It can be added to [`PluginsManager`] by [`PluginsManager::declare_static_plugin`](crate::manager::PluginsManager::declare_static_plugin) method.
 //!
-//! Dynamic plugin is a shared library which exports set of C-repr (unmangled) functions which allows to check plugin compatibility and create plugin instance. These functiuons are defined automatically by [`declare_plugin`](crate::declare_plugin) macro.
+//! Dynamic plugin is a shared library which exports set of C-repr (unmangled) functions which allows to check plugin compatibility and create plugin instance. These functions are defined automatically by [`declare_plugin`] macro.
 //!
 mod compatibility;
 mod manager;
@@ -41,11 +43,16 @@ mod vtable;
 pub use compatibility::{Compatibility, PluginStructVersion, StructVersion};
 pub use manager::{DeclaredPlugin, LoadedPlugin, PluginsManager, StartedPlugin};
 pub use plugin::{
-    Plugin, PluginConditionSetter, PluginControl, PluginInstance, PluginReport, PluginStartArgs,
-    PluginState, PluginStatus, PluginStatusRec,
+    Plugin, PluginConditionSetter, PluginControl, PluginDiff, PluginInstance, PluginReport,
+    PluginStartArgs, PluginState, PluginStatus, PluginStatusRec,
 };
 pub use vtable::{PluginLoaderVersion, PluginVTable, PLUGIN_LOADER_VERSION};
 use zenoh_util::concat_enabled_features;
 
 pub const FEATURES: &str =
     concat_enabled_features!(prefix = "zenoh-plugin-trait", features = ["default"]);
+
+#[doc(hidden)]
+pub mod export {
+    pub use git_version;
+}

@@ -11,37 +11,41 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use flume::r#async::RecvStream;
+use std::time::Duration;
+
 use futures::stream::{Forward, Map};
-use std::{convert::TryInto, time::Duration};
-use zenoh::query::ReplyKeyExpr;
-use zenoh::sample::Locality;
-use zenoh::Result as ZResult;
 use zenoh::{
+    handlers::{fifo, FifoChannelHandler},
     liveliness::LivelinessSubscriberBuilder,
-    prelude::Sample,
-    query::{QueryConsolidation, QueryTarget},
-    subscriber::{PushMode, Reliability, Subscriber, SubscriberBuilder},
+    pubsub::{Subscriber, SubscriberBuilder},
+    query::{QueryConsolidation, QueryTarget, ReplyKeyExpr},
+    sample::{Locality, Sample},
+    Result as ZResult,
 };
 
-use crate::{querying_subscriber::QueryingSubscriberBuilder, FetchingSubscriberBuilder};
+use crate::{
+    querying_subscriber::QueryingSubscriberBuilder, ExtractSample, FetchingSubscriberBuilder,
+};
 
 /// Allows writing `subscriber.forward(receiver)` instead of `subscriber.stream().map(Ok).forward(publisher)`
+#[zenoh_macros::unstable]
 pub trait SubscriberForward<'a, S> {
     type Output;
     fn forward(&'a mut self, sink: S) -> Self::Output;
 }
-impl<'a, S> SubscriberForward<'a, S> for Subscriber<'_, flume::Receiver<Sample>>
+impl<'a, S> SubscriberForward<'a, S> for Subscriber<FifoChannelHandler<Sample>>
 where
     S: futures::sink::Sink<Sample>,
 {
-    type Output = Forward<Map<RecvStream<'a, Sample>, fn(Sample) -> Result<Sample, S::Error>>, S>;
+    type Output =
+        Forward<Map<fifo::RecvStream<'a, Sample>, fn(Sample) -> Result<Sample, S::Error>>, S>;
     fn forward(&'a mut self, sink: S) -> Self::Output {
-        futures::StreamExt::forward(futures::StreamExt::map(self.receiver.stream(), Ok), sink)
+        futures::StreamExt::forward(futures::StreamExt::map(self.stream(), Ok), sink)
     }
 }
 
-/// Some extensions to the [`zenoh::subscriber::SubscriberBuilder`](zenoh::subscriber::SubscriberBuilder)
+/// Some extensions to the [`zenoh::subscriber::SubscriberBuilder`](zenoh::pubsub::SubscriberBuilder)
+#[zenoh_macros::unstable]
 pub trait SubscriberBuilderExt<'a, 'b, Handler> {
     type KeySpace;
 
@@ -59,20 +63,18 @@ pub trait SubscriberBuilderExt<'a, 'b, Handler> {
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
+    /// use zenoh::Wait;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let subscriber = session
     ///     .declare_subscriber("key/expr")
     ///     .fetching( |cb| {
-    ///         use zenoh::prelude::sync::SyncResolve;
     ///         session
     ///             .get("key/expr")
     ///             .callback(cb)
-    ///             .res_sync()
+    ///             .wait()
     ///     })
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// while let Ok(sample) = subscriber.recv_async().await {
@@ -88,8 +90,7 @@ pub trait SubscriberBuilderExt<'a, 'b, Handler> {
         fetch: Fetch,
     ) -> FetchingSubscriberBuilder<'a, 'b, Self::KeySpace, Handler, Fetch, TryIntoSample>
     where
-        TryIntoSample: TryInto<Sample>,
-        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>;
+        TryIntoSample: ExtractSample;
 
     /// Create a [`FetchingSubscriber`](super::FetchingSubscriber) that will perform a query (`session.get()`) as it's
     /// initial fetch.
@@ -106,14 +107,12 @@ pub trait SubscriberBuilderExt<'a, 'b, Handler> {
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let subscriber = session
     ///     .declare_subscriber("key/expr")
     ///     .querying()
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// while let Ok(sample) = subscriber.recv_async().await {
@@ -124,9 +123,7 @@ pub trait SubscriberBuilderExt<'a, 'b, Handler> {
     fn querying(self) -> QueryingSubscriberBuilder<'a, 'b, Self::KeySpace, Handler>;
 }
 
-impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
-    for SubscriberBuilder<'a, 'b, PushMode, Handler>
-{
+impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler> for SubscriberBuilder<'a, 'b, Handler> {
     type KeySpace = crate::UserSpace;
 
     /// Create a [`FetchingSubscriber`](super::FetchingSubscriber).
@@ -143,20 +140,18 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
+    /// use zenoh::Wait;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let subscriber = session
     ///     .declare_subscriber("key/expr")
     ///     .fetching( |cb| {
-    ///         use zenoh::prelude::sync::SyncResolve;
     ///         session
     ///             .get("key/expr")
     ///             .callback(cb)
-    ///             .res_sync()
+    ///             .wait()
     ///     })
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// while let Ok(sample) = subscriber.recv_async().await {
@@ -172,14 +167,12 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
         fetch: Fetch,
     ) -> FetchingSubscriberBuilder<'a, 'b, Self::KeySpace, Handler, Fetch, TryIntoSample>
     where
-        TryIntoSample: TryInto<Sample>,
-        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+        TryIntoSample: ExtractSample,
     {
         FetchingSubscriberBuilder {
             session: self.session,
             key_expr: self.key_expr,
             key_space: crate::UserSpace,
-            reliability: self.reliability,
             origin: self.origin,
             fetch,
             handler: self.handler,
@@ -202,14 +195,12 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let subscriber = session
     ///     .declare_subscriber("key/expr")
     ///     .querying()
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// while let Ok(sample) = subscriber.recv_async().await {
@@ -222,7 +213,6 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
             session: self.session,
             key_expr: self.key_expr,
             key_space: crate::UserSpace,
-            reliability: self.reliability,
             origin: self.origin,
             query_selector: None,
             // By default query all matching publication caches and storages
@@ -257,22 +247,20 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
+    /// use zenoh::Wait;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let subscriber = session
     ///     .liveliness()
     ///     .declare_subscriber("key/expr")
     ///     .fetching( |cb| {
-    ///         use zenoh::prelude::sync::SyncResolve;
     ///         session
     ///             .liveliness()
     ///             .get("key/expr")
     ///             .callback(cb)
-    ///             .res_sync()
+    ///             .wait()
     ///     })
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// while let Ok(sample) = subscriber.recv_async().await {
@@ -288,14 +276,12 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
         fetch: Fetch,
     ) -> FetchingSubscriberBuilder<'a, 'b, Self::KeySpace, Handler, Fetch, TryIntoSample>
     where
-        TryIntoSample: TryInto<Sample>,
-        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+        TryIntoSample: ExtractSample,
     {
         FetchingSubscriberBuilder {
             session: self.session,
             key_expr: self.key_expr,
             key_space: crate::LivelinessSpace,
-            reliability: Reliability::default(),
             origin: Locality::default(),
             fetch,
             handler: self.handler,
@@ -319,15 +305,13 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() {
-    /// use zenoh::prelude::r#async::*;
     /// use zenoh_ext::*;
     ///
-    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     /// let subscriber = session
     ///     .liveliness()
     ///     .declare_subscriber("key/expr")
     ///     .querying()
-    ///     .res()
     ///     .await
     ///     .unwrap();
     /// while let Ok(sample) = subscriber.recv_async().await {
@@ -340,11 +324,10 @@ impl<'a, 'b, Handler> SubscriberBuilderExt<'a, 'b, Handler>
             session: self.session,
             key_expr: self.key_expr,
             key_space: crate::LivelinessSpace,
-            reliability: Reliability::default(),
             origin: Locality::default(),
             query_selector: None,
-            query_target: QueryTarget::default(),
-            query_consolidation: QueryConsolidation::default(),
+            query_target: QueryTarget::DEFAULT,
+            query_consolidation: QueryConsolidation::DEFAULT,
             query_accept_replies: ReplyKeyExpr::MatchingQuery,
             query_timeout: Duration::from_secs(10),
             handler: self.handler,

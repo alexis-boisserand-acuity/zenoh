@@ -16,20 +16,28 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
-use crate::{
-    net::routing::{
-        dispatcher::face::Face,
-        router::{
-            compute_data_routes, compute_matching_pulls, compute_query_routes, RoutesIndexes,
-        },
-    },
-    runtime::Runtime,
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{atomic::AtomicU32, Arc},
 };
 
+use token::{token_new_face, undeclare_simple_token};
+use zenoh_config::WhatAmI;
+use zenoh_protocol::network::{
+    declare::{queryable::ext::QueryableInfoType, QueryableId, SubscriberId, TokenId},
+    interest::InterestId,
+    Oam,
+};
+use zenoh_result::ZResult;
+use zenoh_sync::get_mut_unchecked;
+use zenoh_transport::unicast::TransportUnicast;
+
 use self::{
-    pubsub::{pubsub_new_face, undeclare_client_subscription},
-    queries::{queries_new_face, undeclare_client_queryable},
+    interests::interests_new_face,
+    pubsub::{pubsub_new_face, undeclare_simple_subscription},
+    queries::{queries_new_face, undeclare_simple_queryable},
 };
 use super::{
     super::dispatcher::{
@@ -38,20 +46,18 @@ use super::{
     },
     HatBaseTrait, HatTrait, SendDeclare,
 };
-use std::{
-    any::Any,
-    collections::{HashMap, HashSet},
-    sync::Arc,
+use crate::net::{
+    routing::{
+        dispatcher::{face::Face, interests::RemoteInterest},
+        router::{compute_data_routes, compute_query_routes, RoutesIndexes},
+    },
+    runtime::Runtime,
 };
-use zenoh_config::WhatAmI;
-use zenoh_protocol::network::declare::queryable::ext::QueryableInfo;
-use zenoh_protocol::network::Oam;
-use zenoh_result::ZResult;
-use zenoh_sync::get_mut_unchecked;
-use zenoh_transport::unicast::TransportUnicast;
 
+mod interests;
 mod pubsub;
 mod queries;
+mod token;
 
 macro_rules! face_hat {
     ($f:expr) => {
@@ -99,8 +105,10 @@ impl HatBaseTrait for HatCode {
         face: &mut Face,
         send_declare: &mut SendDeclare,
     ) -> ZResult<()> {
+        interests_new_face(tables, &mut face.state);
         pubsub_new_face(tables, &mut face.state, send_declare);
         queries_new_face(tables, &mut face.state, send_declare);
+        token_new_face(tables, &mut face.state, send_declare);
         Ok(())
     }
 
@@ -112,20 +120,36 @@ impl HatBaseTrait for HatCode {
         _transport: &TransportUnicast,
         send_declare: &mut SendDeclare,
     ) -> ZResult<()> {
+        interests_new_face(tables, &mut face.state);
         pubsub_new_face(tables, &mut face.state, send_declare);
         queries_new_face(tables, &mut face.state, send_declare);
+        token_new_face(tables, &mut face.state, send_declare);
         Ok(())
     }
 
     fn close_face(
         &self,
         tables: &TablesLock,
+        _tables_ref: &Arc<TablesLock>,
         face: &mut Arc<FaceState>,
         send_declare: &mut SendDeclare,
     ) {
         let mut wtables = zwrite!(tables.tables);
         let mut face_clone = face.clone();
         let face = get_mut_unchecked(face);
+        let hat_face = match face.hat.downcast_mut::<HatFace>() {
+            Some(hate_face) => hate_face,
+            None => {
+                tracing::error!("Error downcasting face hat in close_face!");
+                return;
+            }
+        };
+
+        hat_face.remote_interests.clear();
+        hat_face.local_subs.clear();
+        hat_face.local_qabls.clear();
+        hat_face.local_tokens.clear();
+
         for res in face.remote_mappings.values_mut() {
             get_mut_unchecked(res).session_ctxs.remove(&face.id);
             Resource::clean(res);
@@ -138,15 +162,9 @@ impl HatBaseTrait for HatCode {
         face.local_mappings.clear();
 
         let mut subs_matches = vec![];
-        for mut res in face
-            .hat
-            .downcast_mut::<HatFace>()
-            .unwrap()
-            .remote_subs
-            .drain()
-        {
+        for (_id, mut res) in hat_face.remote_subs.drain() {
             get_mut_unchecked(&mut res).session_ctxs.remove(&face.id);
-            undeclare_client_subscription(&mut wtables, &mut face_clone, &mut res, send_declare);
+            undeclare_simple_subscription(&mut wtables, &mut face_clone, &mut res, send_declare);
 
             if res.context.is_some() {
                 for match_ in &res.context().matches {
@@ -166,15 +184,9 @@ impl HatBaseTrait for HatCode {
         }
 
         let mut qabls_matches = vec![];
-        for mut res in face
-            .hat
-            .downcast_mut::<HatFace>()
-            .unwrap()
-            .remote_qabls
-            .drain()
-        {
+        for (_id, mut res) in hat_face.remote_qabls.drain() {
             get_mut_unchecked(&mut res).session_ctxs.remove(&face.id);
-            undeclare_client_queryable(&mut wtables, &mut face_clone, &mut res, send_declare);
+            undeclare_simple_queryable(&mut wtables, &mut face_clone, &mut res, send_declare);
 
             if res.context.is_some() {
                 for match_ in &res.context().matches {
@@ -192,6 +204,11 @@ impl HatBaseTrait for HatCode {
                 qabls_matches.push(res);
             }
         }
+
+        for (_id, mut res) in hat_face.remote_tokens.drain() {
+            get_mut_unchecked(&mut res).session_ctxs.remove(&face.id);
+            undeclare_simple_token(&mut wtables, &mut face_clone, &mut res, send_declare);
+        }
         drop(wtables);
 
         let mut matches_data_routes = vec![];
@@ -199,11 +216,7 @@ impl HatBaseTrait for HatCode {
         let rtables = zread!(tables.tables);
         for _match in subs_matches.drain(..) {
             let mut expr = RoutingExpr::new(&_match, "");
-            matches_data_routes.push((
-                _match.clone(),
-                compute_data_routes(&rtables, &mut expr),
-                compute_matching_pulls(&rtables, &mut expr),
-            ));
+            matches_data_routes.push((_match.clone(), compute_data_routes(&rtables, &mut expr)));
         }
         for _match in qabls_matches.drain(..) {
             matches_query_routes.push((_match.clone(), compute_query_routes(&rtables, &_match)));
@@ -211,13 +224,10 @@ impl HatBaseTrait for HatCode {
         drop(rtables);
 
         let mut wtables = zwrite!(tables.tables);
-        for (mut res, data_routes, matching_pulls) in matches_data_routes {
+        for (mut res, data_routes) in matches_data_routes {
             get_mut_unchecked(&mut res)
                 .context_mut()
                 .update_data_routes(data_routes);
-            get_mut_unchecked(&mut res)
-                .context_mut()
-                .update_matching_pulls(matching_pulls);
             Resource::clean(&mut res);
         }
         for (mut res, query_routes) in matches_query_routes {
@@ -251,16 +261,6 @@ impl HatBaseTrait for HatCode {
         0
     }
 
-    fn closing(
-        &self,
-        _tables: &mut Tables,
-        _tables_ref: &Arc<TablesLock>,
-        _transport: &TransportUnicast,
-        _send_declare: &mut SendDeclare,
-    ) -> ZResult<()> {
-        Ok(())
-    }
-
     #[inline]
     fn ingress_filter(&self, _tables: &Tables, _face: &FaceState, _expr: &mut RoutingExpr) -> bool {
         true
@@ -275,10 +275,8 @@ impl HatBaseTrait for HatCode {
         _expr: &mut RoutingExpr,
     ) -> bool {
         src_face.id != out_face.id
-            && match (src_face.mcast_group.as_ref(), out_face.mcast_group.as_ref()) {
-                (Some(l), Some(r)) => l != r,
-                _ => true,
-            }
+            && out_face.mcast_group.is_none()
+            && src_face.mcast_group.is_none()
     }
 
     fn info(&self, _tables: &Tables, _kind: WhatAmI) -> String {
@@ -295,19 +293,27 @@ impl HatContext {
 }
 
 struct HatFace {
-    local_subs: HashSet<Arc<Resource>>,
-    remote_subs: HashSet<Arc<Resource>>,
-    local_qabls: HashMap<Arc<Resource>, QueryableInfo>,
-    remote_qabls: HashSet<Arc<Resource>>,
+    next_id: AtomicU32, // @TODO: manage rollover and uniqueness
+    remote_interests: HashMap<InterestId, RemoteInterest>,
+    local_subs: HashMap<Arc<Resource>, SubscriberId>,
+    remote_subs: HashMap<SubscriberId, Arc<Resource>>,
+    local_qabls: HashMap<Arc<Resource>, (QueryableId, QueryableInfoType)>,
+    remote_qabls: HashMap<QueryableId, Arc<Resource>>,
+    local_tokens: HashMap<Arc<Resource>, TokenId>,
+    remote_tokens: HashMap<TokenId, Arc<Resource>>,
 }
 
 impl HatFace {
     fn new() -> Self {
         Self {
-            local_subs: HashSet::new(),
-            remote_subs: HashSet::new(),
+            next_id: AtomicU32::new(0),
+            remote_interests: HashMap::new(),
+            local_subs: HashMap::new(),
+            remote_subs: HashMap::new(),
             local_qabls: HashMap::new(),
-            remote_qabls: HashSet::new(),
+            remote_qabls: HashMap::new(),
+            local_tokens: HashMap::new(),
+            remote_tokens: HashMap::new(),
         }
     }
 }

@@ -25,6 +25,14 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_PROFILE_DEV_DEBUG: false
   RUSTUP_WINDOWS_PATH_ADD_BIN: 1
+  # NOTE(fuzzypixelz): This should be changed to "minor" during a release cycle
+  # with plans for changes that REQUIRE a minor version bump as defined by the Cargo reference
+  # (https://doc.rust-lang.org/cargo/reference/semver.html).
+  # However, a minor release could be published without such changes, in which case this variable need not be changed.
+  CARGO_SEMVER_CHECKS_RELEASE_TYPE: patch
+  # NOTE(fuzzypixelz): cargo-semver-checks uses the previous released version as a baseline, not the latest released
+  # version on crates.io. Thus this needs to be updated after every release.
+  CARGO_SEMVER_CHECKS_BASELINE_VERSION: 1.0.0
 
 jobs:
   check:
@@ -39,23 +47,44 @@ jobs:
       - name: Clone this repository
         uses: actions/checkout@v4
 
-      - name: Setup rust-cache
-        uses: Swatinem/rust-cache@v2
-
       - name: Update Stable Rust toolchain
         run: rustup update stable
+
+      - name: Setup rust-cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Install latest cargo-deny
         uses: taiki-e/install-action@cargo-deny
 
+      - name: Install latest cargo-machete
+        uses: taiki-e/install-action@cargo-machete
+
+      - name: Install latest cargo-semver-checks
+        uses: taiki-e/install-action@cargo-semver-checks
+
       - name: Code format check
-        run: cargo fmt --check
+        run: cargo fmt --check -- --config "unstable_features=true,imports_granularity=Crate,group_imports=StdExternalCrate"
 
-      - name: Clippy
-        run: cargo +stable clippy --all-targets -- --deny warnings
+      - name: Clippy zenoh no-default-features
+        run: cargo +stable clippy -p zenoh --all-targets --no-default-features -- --deny warnings
 
-      - name: Clippy unstable targets
-        run: cargo +stable clippy --all-targets --features unstable -- --deny warnings
+      - name: Clippy zenoh
+        run: cargo +stable clippy -p zenoh --all-targets -- --deny warnings
+
+      - name: Clippy zenoh unstable
+        run: cargo +stable clippy -p zenoh --all-targets --features unstable -- --deny warnings
+
+      - name: Clippy zenoh internal
+        run: cargo +stable clippy -p zenoh --all-targets --features unstable,internal -- --deny warnings
+
+      - name: Clippy zenoh shared-memory
+        run: cargo +stable clippy -p zenoh --all-targets --features unstable,shared-memory -- --deny warnings
+
+      - name: Clippy workspace
+        run: cargo +stable clippy --all-targets --features test -- --deny warnings
+
+      - name: Clippy workspace unstable
+        run: cargo +stable clippy --all-targets --features unstable,test -- --deny warnings
 
       - name: Clippy all features
         if: ${{ matrix.os == 'ubuntu-latest' || matrix.os == 'macOS-latest' }}
@@ -71,8 +100,19 @@ jobs:
       - name: Run doctests
         run: cargo test --doc
 
+      - name: Build doc
+        run: cargo doc --no-deps --features unstable
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
       - name: Check licenses
         run: cargo deny check licenses
+
+      - name: Check unused dependencies
+        run: cargo machete
+
+      - name: Check SemVer Compatibility
+        run: cargo +stable semver-checks --verbose --default-features --package zenoh --release-type ${{ env.CARGO_SEMVER_CHECKS_RELEASE_TYPE }} --baseline-version ${{ env.CARGO_SEMVER_CHECKS_BASELINE_VERSION }}
 
   test:
     name: Unit tests on ${{ matrix.os }}
@@ -103,11 +143,15 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Run tests
-        run: cargo nextest run --exclude zenoh-examples --exclude zenoh-plugin-example --workspace
+        run: cargo nextest run -F test --exclude zenoh-examples --exclude zenoh-plugin-example --workspace
 
       - name: Run tests with SHM
+        if: ${{ matrix.os == 'macOS-latest' || matrix.os == 'windows-latest' }}
+        run: cargo nextest run -F test -F shared-memory -F unstable -E 'not (test(test_default_features))' --exclude zenoh-examples --exclude zenoh-plugin-example --workspace
+
+      - name: Run tests with SHM + unixpipe
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: cargo nextest run -F shared-memory -F transport_unixpipe -p zenoh-transport
+        run: cargo nextest run -F test -F shared-memory -F unstable -F transport_unixpipe -E 'not (test(test_default_features))' --exclude zenoh-examples --exclude zenoh-plugin-example --workspace
 
       - name: Check for feature leaks
         if: ${{ matrix.os == 'ubuntu-latest' }}
@@ -137,7 +181,7 @@ jobs:
     name: Typos Check
     runs-on: ubuntu-latest
     steps:
-      - name: Clone this repository 
+      - name: Clone this repository
         uses: actions/checkout@v4
 
       - name: Check spelling

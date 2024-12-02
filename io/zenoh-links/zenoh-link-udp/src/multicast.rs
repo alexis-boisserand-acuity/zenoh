@@ -11,17 +11,25 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::{config::*, UDP_DEFAULT_MTU};
-use crate::{get_udp_addrs, socket_addr_to_udp_locator};
+use std::{
+    borrow::Cow,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use std::{borrow::Cow, fmt};
 use tokio::net::UdpSocket;
 use zenoh_link_commons::{LinkManagerMulticastTrait, LinkMulticast, LinkMulticastTrait};
-use zenoh_protocol::core::{Config, EndPoint, Locator};
+use zenoh_protocol::{
+    core::{Config, EndPoint, Locator},
+    transport::BatchSize,
+};
 use zenoh_result::{bail, zerror, Error as ZError, ZResult};
+
+use super::{config::*, UDP_DEFAULT_MTU};
+use crate::{get_udp_addrs, socket_addr_to_udp_locator};
 
 pub struct LinkMulticastUdp {
     // The unicast socket address of this link
@@ -73,14 +81,31 @@ impl LinkMulticastTrait for LinkMulticastUdp {
     }
 
     async fn write(&self, buffer: &[u8]) -> ZResult<usize> {
-        self.unicast_socket
+        match self
+            .unicast_socket
             .send_to(buffer, self.multicast_addr)
             .await
-            .map_err(|e| {
-                let e = zerror!("Write error on UDP link {}: {}", self, e);
-                tracing::trace!("{}", e);
-                e.into()
-            })
+        {
+            Ok(size) => Ok(size),
+            std::io::Result::Err(e) => {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let e = zerror!("Write error on UDP link {}: {}", self, e);
+                    tracing::trace!("{}", e);
+                    Err(e.into())
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(55) = e.raw_os_error() {
+                    // No buffer space available
+                    tracing::trace!("Write error on UDP link {}: {}", self, e);
+                    Ok(0)
+                } else {
+                    let e = zerror!("Write error on UDP link {}: {}", self, e);
+                    tracing::trace!("{}", e);
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     async fn write_all(&self, buffer: &[u8]) -> ZResult<()> {
@@ -119,7 +144,7 @@ impl LinkMulticastTrait for LinkMulticastUdp {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
+    fn get_mtu(&self) -> BatchSize {
         *UDP_DEFAULT_MTU
     }
 

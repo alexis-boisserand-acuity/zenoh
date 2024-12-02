@@ -13,8 +13,6 @@
 //
 use super::*;
 
-pub const ENV: &str = "ZENOH_CONFIG";
-
 macro_rules! mode_accessor {
     ($type:ty) => {
         #[inline]
@@ -34,9 +32,45 @@ pub const mode: WhatAmI = WhatAmI::Peer;
 
 #[allow(non_upper_case_globals)]
 #[allow(dead_code)]
+pub mod connect {
+    use super::{ModeDependentValue, ModeValues};
+
+    pub const timeout_ms: ModeDependentValue<i64> = ModeDependentValue::Dependent(ModeValues {
+        router: Some(-1),
+        peer: Some(-1),
+        client: Some(0),
+    });
+    pub const exit_on_failure: ModeDependentValue<bool> =
+        ModeDependentValue::Dependent(ModeValues {
+            router: Some(false),
+            peer: Some(false),
+            client: Some(true),
+        });
+}
+
+#[allow(non_upper_case_globals)]
+#[allow(dead_code)]
+pub mod listen {
+    use super::ModeDependentValue;
+
+    pub const timeout_ms: ModeDependentValue<i64> = ModeDependentValue::Unique(0);
+    pub const exit_on_failure: ModeDependentValue<bool> = ModeDependentValue::Unique(true);
+}
+
+#[allow(non_upper_case_globals)]
+#[allow(dead_code)]
+pub mod open {
+    pub mod return_conditions {
+        pub const connect_scouted: bool = true;
+        pub const declares: bool = true;
+    }
+}
+
+#[allow(non_upper_case_globals)]
+#[allow(dead_code)]
 pub mod scouting {
     pub const timeout: u64 = 3000;
-    pub const delay: u64 = 200;
+    pub const delay: u64 = 500;
     pub mod multicast {
         pub const enabled: bool = true;
         pub const address: ([u8; 4], u16) = ([224, 0, 0, 224], 7446);
@@ -97,6 +131,34 @@ pub mod routing {
     }
     pub mod peer {
         pub const mode: &str = "peer_to_peer";
+    }
+}
+
+impl Default for ListenConfig {
+    #[allow(clippy::unnecessary_cast)]
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            endpoints: ModeDependentValue::Dependent(ModeValues {
+                router: Some(vec!["tcp/[::]:7447".parse().unwrap()]),
+                peer: Some(vec!["tcp/[::]:0".parse().unwrap()]),
+                client: None,
+            }),
+            exit_on_failure: None,
+            retry: None,
+        }
+    }
+}
+
+impl Default for ConnectConfig {
+    #[allow(clippy::unnecessary_cast)]
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            endpoints: ModeDependentValue::Unique(vec![]),
+            exit_on_failure: None,
+            retry: None,
+        }
     }
 }
 
@@ -167,16 +229,6 @@ impl Default for LinkTxConf {
     }
 }
 
-impl Default for QueueConf {
-    fn default() -> Self {
-        Self {
-            size: QueueSizeConf::default(),
-            congestion_control: CongestionControlConf::default(),
-            backoff: 100,
-        }
-    }
-}
-
 impl QueueSizeConf {
     pub const MIN: usize = 1;
     pub const MAX: usize = 16;
@@ -197,10 +249,28 @@ impl Default for QueueSizeConf {
     }
 }
 
-impl Default for CongestionControlConf {
+impl Default for CongestionControlDropConf {
     fn default() -> Self {
         Self {
             wait_before_drop: 1000,
+            max_wait_before_drop_fragments: 50000,
+        }
+    }
+}
+
+impl Default for CongestionControlBlockConf {
+    fn default() -> Self {
+        Self {
+            wait_before_close: 5000000,
+        }
+    }
+}
+
+impl Default for BatchingConf {
+    fn default() -> Self {
+        BatchingConf {
+            enabled: true,
+            time_limit: 1,
         }
     }
 }
@@ -216,9 +286,9 @@ impl Default for LinkRxConf {
 
 // Make explicit the value and ignore clippy warning
 #[allow(clippy::derivable_impls)]
-impl Default for SharedMemoryConf {
+impl Default for ShmConf {
     fn default() -> Self {
-        Self { enabled: false }
+        Self { enabled: true }
     }
 }
 
@@ -228,26 +298,11 @@ impl Default for AclConfig {
             enabled: false,
             default_permission: Permission::Deny,
             rules: None,
+            subjects: None,
+            policies: None,
         }
     }
 }
-
-pub const DEFAULT_CONNECT_TIMEOUT_MS: ModeDependentValue<i64> =
-    ModeDependentValue::Dependent(ModeValues {
-        client: Some(0),
-        peer: Some(-1),
-        router: Some(-1),
-    });
-
-pub const DEFAULT_CONNECT_EXIT_ON_FAIL: ModeDependentValue<bool> =
-    ModeDependentValue::Dependent(ModeValues {
-        client: Some(true),
-        peer: Some(false),
-        router: Some(false),
-    });
-
-pub const DEFAULT_LISTEN_TIMEOUT_MS: ModeDependentValue<i64> = ModeDependentValue::Unique(0);
-pub const DEFAULT_LISTEN_EXIT_ON_FAIL: ModeDependentValue<bool> = ModeDependentValue::Unique(true);
 
 impl Default for ConnectionRetryModeDependentConf {
     fn default() -> Self {

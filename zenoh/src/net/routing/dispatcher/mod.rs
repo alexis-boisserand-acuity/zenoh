@@ -16,9 +16,11 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 pub mod face;
+pub mod interests;
 pub mod pubsub;
 pub mod queries;
 pub mod resource;
 pub mod tables;
+pub mod token;

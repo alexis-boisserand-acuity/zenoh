@@ -23,9 +23,11 @@ license = { workspace = true }
 categories = { workspace = true }
 description = "Internal crate for zenoh."
 
+[features]
+internal = []
+
 [dependencies]
-tracing = {workspace = true}
-flume = { workspace = true }
+tracing = { workspace = true }
 json5 = { workspace = true }
 num_cpus = { workspace = true }
 serde = { workspace = true, features = ["default"] }
@@ -36,4 +38,9 @@ zenoh-core = { workspace = true }
 zenoh-protocol = { workspace = true }
 zenoh-result = { workspace = true }
 zenoh-util = { workspace = true }
+zenoh-macros = { workspace = true }
 secrecy = { workspace = true }
+uhlc = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]

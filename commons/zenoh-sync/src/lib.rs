@@ -16,11 +16,17 @@
 //!
 //! This module is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use futures::FutureExt;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+
+pub mod event;
+pub use event::*;
 
 pub mod fifo_queue;
 pub use fifo_queue::*;

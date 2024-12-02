@@ -11,20 +11,22 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::sync::RwLock;
+use std::collections::{hash_map::Entry, HashMap};
+
 use async_trait::async_trait;
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    sync::Arc,
+use tokio::sync::RwLock;
+use zenoh::{
+    bytes::{Encoding, ZBytes},
+    key_expr::OwnedKeyExpr,
+    time::Timestamp,
+    Result as ZResult,
 };
-use zenoh::{prelude::OwnedKeyExpr, sample::Sample, time::Timestamp, value::Value};
 use zenoh_backend_traits::{
     config::{StorageConfig, VolumeConfig},
     Capability, History, Persistence, Storage, StorageInsertionResult, StoredData, Volume,
     VolumeInstance,
 };
 use zenoh_plugin_trait::{plugin_long_version, plugin_version, Plugin};
-use zenoh_result::ZResult;
 
 #[cfg(feature = "dynamic_plugin")]
 zenoh_plugin_trait::declare_plugin!(ExampleBackend);
@@ -65,17 +67,10 @@ impl Volume for ExampleBackend {
         Capability {
             persistence: Persistence::Volatile,
             history: History::Latest,
-            read_cost: 0,
         }
     }
     async fn create_storage(&self, _props: StorageConfig) -> ZResult<Box<dyn Storage>> {
         Ok(Box::<ExampleStorage>::default())
-    }
-    fn incoming_data_interceptor(&self) -> Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>> {
-        None
-    }
-    fn outgoing_data_interceptor(&self) -> Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>> {
-        None
     }
 }
 
@@ -87,17 +82,26 @@ impl Storage for ExampleStorage {
     async fn put(
         &mut self,
         key: Option<OwnedKeyExpr>,
-        value: Value,
+        payload: ZBytes,
+        encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
         let mut map = self.map.write().await;
         match map.entry(key) {
             Entry::Occupied(mut e) => {
-                e.insert(StoredData { value, timestamp });
+                e.insert(StoredData {
+                    payload,
+                    encoding,
+                    timestamp,
+                });
                 return Ok(StorageInsertionResult::Replaced);
             }
             Entry::Vacant(e) => {
-                e.insert(StoredData { value, timestamp });
+                e.insert(StoredData {
+                    payload,
+                    encoding,
+                    timestamp,
+                });
                 return Ok(StorageInsertionResult::Inserted);
             }
         }

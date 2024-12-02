@@ -11,16 +11,21 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
-use zenoh::prelude::r#async::*;
-use zenoh::time::Timestamp;
-use zenoh_backend_traits::config::{StorageConfig, VolumeConfig};
-use zenoh_backend_traits::*;
+use tokio::sync::RwLock;
+use zenoh::{
+    bytes::{Encoding, ZBytes},
+    key_expr::OwnedKeyExpr,
+    time::Timestamp,
+    Result as ZResult,
+};
+use zenoh_backend_traits::{
+    config::{StorageConfig, VolumeConfig},
+    *,
+};
 use zenoh_plugin_trait::{plugin_long_version, plugin_version, Plugin};
-use zenoh_result::ZResult;
 
 use crate::MEMORY_BACKEND_NAME;
 
@@ -53,33 +58,12 @@ impl Volume for MemoryBackend {
         Capability {
             persistence: Persistence::Volatile,
             history: History::Latest,
-            read_cost: 0,
         }
     }
 
     async fn create_storage(&self, properties: StorageConfig) -> ZResult<Box<dyn Storage>> {
         tracing::debug!("Create Memory Storage with configuration: {:?}", properties);
         Ok(Box::new(MemoryStorage::new(properties).await?))
-    }
-
-    fn incoming_data_interceptor(&self) -> Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>> {
-        // By default: no interception point
-        None
-        // To test interceptors, uncomment this line:
-        // Some(Arc::new(|sample| {
-        //     trace!(">>>> IN INTERCEPTOR FOR {:?}", sample);
-        //     sample
-        // }))
-    }
-
-    fn outgoing_data_interceptor(&self) -> Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>> {
-        // By default: no interception point
-        None
-        // To test interceptors, uncomment this line:
-        // Some(Arc::new(|sample| {
-        //     trace!("<<<< OUT INTERCEPTOR FOR {:?}", sample);
-        //     sample
-        // }))
     }
 }
 
@@ -113,18 +97,27 @@ impl Storage for MemoryStorage {
     async fn put(
         &mut self,
         key: Option<OwnedKeyExpr>,
-        value: Value,
+        payload: ZBytes,
+        encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
         tracing::trace!("put for {:?}", key);
         let mut map = self.map.write().await;
         match map.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.insert(StoredData { value, timestamp });
+                e.insert(StoredData {
+                    payload,
+                    encoding,
+                    timestamp,
+                });
                 return Ok(StorageInsertionResult::Replaced);
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(StoredData { value, timestamp });
+                e.insert(StoredData {
+                    payload,
+                    encoding,
+                    timestamp,
+                });
                 return Ok(StorageInsertionResult::Inserted);
             }
         }

@@ -16,14 +16,16 @@ use alloc::{
     boxed::Box,
     format,
     string::{String, ToString},
-    vec::Vec,
 };
 use core::{
     convert::{From, TryFrom, TryInto},
-    fmt,
+    fmt::{self, Display},
     hash::Hash,
+    ops::{Deref, RangeInclusive},
     str::FromStr,
 };
+
+use serde::Serialize;
 pub use uhlc::{Timestamp, NTP64};
 use zenoh_keyexpr::OwnedKeyExpr;
 use zenoh_result::{bail, zerror};
@@ -34,7 +36,6 @@ pub type TimestampId = uhlc::ID;
 /// Constants and helpers for zenoh `whatami` flags.
 pub mod whatami;
 pub use whatami::*;
-
 pub use zenoh_keyexpr::key_expr;
 
 pub mod wire_expr;
@@ -42,8 +43,8 @@ pub use wire_expr::*;
 
 mod cowstr;
 pub use cowstr::CowStr;
-mod encoding;
-pub use encoding::{Encoding, KnownEncoding};
+pub mod encoding;
+pub use encoding::{Encoding, EncodingId};
 
 pub mod locator;
 pub use locator::*;
@@ -54,49 +55,15 @@ pub use endpoint::*;
 pub mod resolution;
 pub use resolution::*;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Property {
-    pub key: u64,
-    pub value: Vec<u8>,
-}
-
-/// The kind of a `Sample`.
-#[repr(u8)]
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
-pub enum SampleKind {
-    /// if the `Sample` was issued by a `put` operation.
-    #[default]
-    Put = 0,
-    /// if the `Sample` was issued by a `delete` operation.
-    Delete = 1,
-}
-
-impl fmt::Display for SampleKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SampleKind::Put => write!(f, "PUT"),
-            SampleKind::Delete => write!(f, "DELETE"),
-        }
-    }
-}
-
-impl TryFrom<u64> for SampleKind {
-    type Error = u64;
-    fn try_from(kind: u64) -> Result<Self, u64> {
-        match kind {
-            0 => Ok(SampleKind::Put),
-            1 => Ok(SampleKind::Delete),
-            _ => Err(kind),
-        }
-    }
-}
+pub mod parameters;
+pub use parameters::Parameters;
 
 /// The global unique id of a zenoh peer.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct ZenohId(uhlc::ID);
+pub struct ZenohIdProto(uhlc::ID);
 
-impl ZenohId {
+impl ZenohIdProto {
     pub const MAX_SIZE: usize = 16;
 
     #[inline]
@@ -109,8 +76,8 @@ impl ZenohId {
         self.0.to_le_bytes()
     }
 
-    pub fn rand() -> ZenohId {
-        ZenohId(uhlc::ID::rand())
+    pub fn rand() -> ZenohIdProto {
+        ZenohIdProto(uhlc::ID::rand())
     }
 
     pub fn into_keyexpr(self) -> OwnedKeyExpr {
@@ -118,7 +85,7 @@ impl ZenohId {
     }
 }
 
-impl Default for ZenohId {
+impl Default for ZenohIdProto {
     fn default() -> Self {
         Self::rand()
     }
@@ -153,7 +120,7 @@ impl fmt::Display for SizeError {
 
 macro_rules! derive_tryfrom {
     ($T: ty) => {
-        impl TryFrom<$T> for ZenohId {
+        impl TryFrom<$T> for ZenohIdProto {
             type Error = zenoh_result::Error;
             fn try_from(val: $T) -> Result<Self, Self::Error> {
                 match val.try_into() {
@@ -198,7 +165,7 @@ derive_tryfrom!([u8; 16]);
 derive_tryfrom!(&[u8; 16]);
 derive_tryfrom!(&[u8]);
 
-impl FromStr for ZenohId {
+impl FromStr for ZenohIdProto {
     type Err = zenoh_result::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -211,31 +178,37 @@ impl FromStr for ZenohId {
         let u: uhlc::ID = s
             .parse()
             .map_err(|e: uhlc::ParseIDError| zerror!("Invalid id: {} - {}", s, e.cause))?;
-        Ok(ZenohId(u))
+        Ok(ZenohIdProto(u))
     }
 }
 
-impl fmt::Debug for ZenohId {
+impl fmt::Debug for ZenohIdProto {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl fmt::Display for ZenohId {
+impl fmt::Display for ZenohIdProto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }
 
 // A PeerID can be converted into a Timestamp's ID
-impl From<&ZenohId> for uhlc::ID {
-    fn from(zid: &ZenohId) -> Self {
+impl From<&ZenohIdProto> for uhlc::ID {
+    fn from(zid: &ZenohIdProto) -> Self {
         zid.0
     }
 }
 
-impl From<ZenohId> for OwnedKeyExpr {
-    fn from(zid: ZenohId) -> Self {
+impl From<ZenohIdProto> for uhlc::ID {
+    fn from(zid: ZenohIdProto) -> Self {
+        zid.0
+    }
+}
+
+impl From<ZenohIdProto> for OwnedKeyExpr {
+    fn from(zid: ZenohIdProto) -> Self {
         // SAFETY: zid.to_string() returns an stringified hexadecimal
         // representation of the zid. Therefore, building a OwnedKeyExpr
         // by calling from_string_unchecked() is safe because it is
@@ -244,13 +217,13 @@ impl From<ZenohId> for OwnedKeyExpr {
     }
 }
 
-impl From<&ZenohId> for OwnedKeyExpr {
-    fn from(zid: &ZenohId) -> Self {
+impl From<&ZenohIdProto> for OwnedKeyExpr {
+    fn from(zid: &ZenohIdProto) -> Self {
         (*zid).into()
     }
 }
 
-impl serde::Serialize for ZenohId {
+impl serde::Serialize for ZenohIdProto {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -259,7 +232,7 @@ impl serde::Serialize for ZenohId {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for ZenohId {
+impl<'de> serde::Deserialize<'de> for ZenohIdProto {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -267,10 +240,13 @@ impl<'de> serde::Deserialize<'de> for ZenohId {
         struct ZenohIdVisitor;
 
         impl<'de> serde::de::Visitor<'de> for ZenohIdVisitor {
-            type Value = ZenohId;
+            type Value = ZenohIdProto;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str(&format!("An hex string of 1-{} bytes", ZenohId::MAX_SIZE))
+                formatter.write_str(&format!(
+                    "An hex string of 1-{} bytes",
+                    ZenohIdProto::MAX_SIZE
+                ))
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
@@ -299,8 +275,29 @@ impl<'de> serde::Deserialize<'de> for ZenohId {
     }
 }
 
-#[repr(u8)]
+/// The unique id of a zenoh entity inside it's parent `Session`.
+pub type EntityId = u32;
+
+/// The global unique id of a zenoh entity.
 #[derive(Debug, Default, Copy, Clone, Eq, Hash, PartialEq)]
+pub struct EntityGlobalIdProto {
+    pub zid: ZenohIdProto,
+    pub eid: EntityId,
+}
+
+impl EntityGlobalIdProto {
+    #[cfg(feature = "test")]
+    pub fn rand() -> Self {
+        use rand::Rng;
+        Self {
+            zid: ZenohIdProto::rand(),
+            eid: rand::thread_rng().gen(),
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Default, Copy, Clone, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize)]
 pub enum Priority {
     Control = 0,
     RealTime = 1,
@@ -313,7 +310,119 @@ pub enum Priority {
     Background = 7,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize)]
+/// A [`Priority`] range bounded inclusively below and above.
+pub struct PriorityRange(RangeInclusive<Priority>);
+
+impl Deref for PriorityRange {
+    type Target = RangeInclusive<Priority>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PriorityRange {
+    pub fn new(range: RangeInclusive<Priority>) -> Self {
+        Self(range)
+    }
+
+    /// Returns `true` if `self` is a superset of `other`.
+    pub fn includes(&self, other: &PriorityRange) -> bool {
+        self.start() <= other.start() && other.end() <= self.end()
+    }
+
+    pub fn len(&self) -> usize {
+        *self.end() as usize - *self.start() as usize + 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "test")]
+    pub fn rand() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let start = rng.gen_range(Priority::MAX as u8..Priority::MIN as u8);
+        let end = rng.gen_range((start + 1)..=Priority::MIN as u8);
+
+        Self(Priority::try_from(start).unwrap()..=Priority::try_from(end).unwrap())
+    }
+}
+
+impl Display for PriorityRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", *self.start() as u8, *self.end() as u8)
+    }
+}
+
+#[derive(Debug)]
+pub enum InvalidPriorityRange {
+    InvalidSyntax { found: String },
+    InvalidBound { message: String },
+}
+
+impl Display for InvalidPriorityRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InvalidPriorityRange::InvalidSyntax { found } => write!(f, "invalid PriorityRange string, expected an range of the form `start-end` but found {found}"),
+            InvalidPriorityRange::InvalidBound { message } => write!(f, "invalid PriorityRange bound: {message}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for InvalidPriorityRange {}
+
+impl FromStr for PriorityRange {
+    type Err = InvalidPriorityRange;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        const SEPARATOR: &str = "-";
+        let mut metadata = s.split(SEPARATOR);
+
+        let start = metadata
+            .next()
+            .ok_or_else(|| InvalidPriorityRange::InvalidSyntax {
+                found: s.to_string(),
+            })?
+            .parse::<u8>()
+            .map(Priority::try_from)
+            .map_err(|err| InvalidPriorityRange::InvalidBound {
+                message: err.to_string(),
+            })?
+            .map_err(|err| InvalidPriorityRange::InvalidBound {
+                message: err.to_string(),
+            })?;
+
+        let end = metadata
+            .next()
+            .ok_or_else(|| InvalidPriorityRange::InvalidSyntax {
+                found: s.to_string(),
+            })?
+            .parse::<u8>()
+            .map(Priority::try_from)
+            .map_err(|err| InvalidPriorityRange::InvalidBound {
+                message: err.to_string(),
+            })?
+            .map_err(|err| InvalidPriorityRange::InvalidBound {
+                message: err.to_string(),
+            })?;
+
+        if metadata.next().is_some() {
+            return Err(InvalidPriorityRange::InvalidSyntax {
+                found: s.to_string(),
+            });
+        };
+
+        Ok(PriorityRange::new(start..=end))
+    }
+}
+
 impl Priority {
+    /// Default
+    pub const DEFAULT: Self = Self::Data;
     /// The lowest Priority
     pub const MIN: Self = Self::Background;
     /// The highest Priority
@@ -345,15 +454,17 @@ impl TryFrom<u8> for Priority {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[repr(u8)]
 pub enum Reliability {
+    BestEffort = 0,
     #[default]
-    BestEffort,
-    Reliable,
+    Reliable = 1,
 }
 
 impl Reliability {
+    pub const DEFAULT: Self = Self::Reliable;
+
     #[cfg(feature = "test")]
     pub fn rand() -> Self {
         use rand::Rng;
@@ -368,66 +479,98 @@ impl Reliability {
     }
 }
 
+impl From<bool> for Reliability {
+    fn from(value: bool) -> Self {
+        if value {
+            Reliability::Reliable
+        } else {
+            Reliability::BestEffort
+        }
+    }
+}
+
+impl From<Reliability> for bool {
+    fn from(value: Reliability) -> Self {
+        match value {
+            Reliability::BestEffort => false,
+            Reliability::Reliable => true,
+        }
+    }
+}
+
+impl Display for Reliability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", *self as u8)
+    }
+}
+
+#[derive(Debug)]
+pub struct InvalidReliability {
+    found: String,
+}
+
+impl Display for InvalidReliability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid Reliability string, expected `{}` or `{}` but found {}",
+            Reliability::Reliable as u8,
+            Reliability::BestEffort as u8,
+            self.found
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for InvalidReliability {}
+
+impl FromStr for Reliability {
+    type Err = InvalidReliability;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let Ok(desc) = s.parse::<u8>() else {
+            return Err(InvalidReliability {
+                found: s.to_string(),
+            });
+        };
+
+        if desc == Reliability::BestEffort as u8 {
+            Ok(Reliability::BestEffort)
+        } else if desc == Reliability::Reliable as u8 {
+            Ok(Reliability::Reliable)
+        } else {
+            return Err(InvalidReliability {
+                found: s.to_string(),
+            });
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct Channel {
     pub priority: Priority,
     pub reliability: Reliability,
 }
 
-/// The kind of congestion control.
+impl Channel {
+    pub const DEFAULT: Self = Self {
+        priority: Priority::DEFAULT,
+        reliability: Reliability::DEFAULT,
+    };
+}
+
+/// Congestion control strategy.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CongestionControl {
     #[default]
+    /// When transmitting a message in a node with a full queue, the node may drop the message.
     Drop = 0,
+    /// When transmitting a message in a node with a full queue, the node will wait for queue to
+    /// progress.
     Block = 1,
 }
 
-/// The subscription mode.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SubMode {
-    #[default]
-    Push = 0,
-    Pull = 1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SubInfo {
-    pub reliability: Reliability,
-    pub mode: SubMode,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-pub struct QueryableInfo {
-    pub complete: u64, // Default 0: incomplete
-    pub distance: u64, // Default 0: no distance
-}
-
-/// The kind of consolidation.
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub enum ConsolidationMode {
-    /// No consolidation applied: multiple samples may be received for the same key-timestamp.
-    None,
-    /// Monotonic consolidation immediately forwards samples, except if one with an equal or more recent timestamp
-    /// has already been sent with the same key.
-    ///
-    /// This optimizes latency while potentially reducing bandwidth.
-    ///
-    /// Note that this doesn't cause re-ordering, but drops the samples for which a more recent timestamp has already
-    /// been observed with the same key.
-    Monotonic,
-    /// Holds back samples to only send the set of samples that had the highest timestamp for their key.
-    Latest,
-}
-
-/// The `zenoh::queryable::Queryable`s that should be target of a `zenoh::Session::get()`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum QueryTarget {
-    #[default]
-    BestMatching,
-    All,
-    AllComplete,
-    #[cfg(feature = "complete_n")]
-    Complete(u64),
+impl CongestionControl {
+    pub const DEFAULT: Self = Self::Drop;
 }

@@ -12,8 +12,9 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use crate::{keyexpr, OwnedKeyExpr};
 use alloc::boxed::Box;
+
+use crate::{keyexpr, OwnedKeyExpr};
 pub mod default_impls;
 
 /// The basic immutable methods of all KeTrees.
@@ -26,7 +27,7 @@ pub trait IKeyExprTree<'a, Weight> {
     /// Accesses the node at `key` if it exists, treating KEs as if they were completely verbatim keys.
     ///
     /// Returns `None` if `key` is not present in the KeTree.
-    fn node(&'a self, key: &keyexpr) -> Option<&Self::Node>;
+    fn node(&'a self, key: &keyexpr) -> Option<&'a Self::Node>;
 
     /// Returns a reference to the weight of the node at `key` if it exists.
     fn weight_at(&'a self, key: &keyexpr) -> Option<&'a Weight> {

@@ -11,6 +11,17 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::time::Duration;
+
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use zenoh_buffers::ZSliceBuffer;
+use zenoh_link::Link;
+use zenoh_protocol::transport::{KeepAlive, TransportMessage};
+use zenoh_result::{zerror, ZResult};
+use zenoh_sync::{RecyclingObject, RecyclingObjectPool};
+#[cfg(feature = "stats")]
+use {crate::common::stats::TransportStats, std::sync::Arc};
+
 use super::transport::TransportUnicastUniversal;
 use crate::{
     common::{
@@ -23,14 +34,6 @@ use crate::{
     },
     unicast::link::{TransportLinkUnicast, TransportLinkUnicastRx, TransportLinkUnicastTx},
 };
-use std::time::Duration;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use zenoh_buffers::ZSliceBuffer;
-use zenoh_protocol::transport::{KeepAlive, TransportMessage};
-use zenoh_result::{zerror, ZResult};
-use zenoh_sync::{RecyclingObject, RecyclingObjectPool};
-#[cfg(feature = "stats")]
-use {crate::common::stats::TransportStats, std::sync::Arc};
 
 #[derive(Clone)]
 pub(super) struct TransportLinkUnicastUniversal {
@@ -60,7 +63,9 @@ impl TransportLinkUnicastUniversal {
             },
             queue_size: transport.manager.config.queue_size,
             wait_before_drop: transport.manager.config.wait_before_drop,
-            backoff: transport.manager.config.queue_backoff,
+            wait_before_close: transport.manager.config.wait_before_close,
+            batching_enabled: transport.manager.config.batching,
+            batching_time_limit: transport.manager.config.queue_backoff,
         };
 
         // The pipeline
@@ -110,6 +115,8 @@ impl TransportLinkUnicastUniversal {
     }
 
     pub(super) fn start_rx(&mut self, transport: TransportUnicastUniversal, lease: Duration) {
+        let priorities = self.link.config.priorities.clone();
+        let reliability = self.link.config.reliability;
         let mut rx = self.link.rx();
         let token = self.token.clone();
         let task = async move {
@@ -130,8 +137,12 @@ impl TransportLinkUnicastUniversal {
                 // Spawn a task to avoid a deadlock waiting for this same task
                 // to finish in the close() joining its handle
                 // WARN: Must be spawned on RX
-                zenoh_runtime::ZRuntime::RX
-                    .spawn(async move { transport.del_link((&rx.link).into()).await });
+
+                zenoh_runtime::ZRuntime::RX.spawn(async move {
+                    transport
+                        .del_link(Link::new_unicast(&rx.link, priorities, reliability))
+                        .await
+                });
 
                 // // WARN: This ZRuntime blocks
                 // zenoh_runtime::ZRuntime::Net
@@ -167,39 +178,42 @@ async fn tx_task(
     token: CancellationToken,
     #[cfg(feature = "stats")] stats: Arc<TransportStats>,
 ) -> ZResult<()> {
-    let mut interval =
-        tokio::time::interval_at(tokio::time::Instant::now() + keep_alive, keep_alive);
     loop {
         tokio::select! {
-            res = pipeline.pull() => {
-                if let Some((mut batch, priority)) = res {
-                    link.send_batch(&mut batch).await?;
+            res = tokio::time::timeout(keep_alive, pipeline.pull()) => {
+                match res {
+                    Ok(Some((mut batch, priority))) => {
+                        link.send_batch(&mut batch).await?;
 
-                    #[cfg(feature = "stats")]
-                    {
-                        stats.inc_tx_t_msgs(batch.stats.t_msgs);
-                        stats.inc_tx_bytes(batch.len() as usize);
+                        #[cfg(feature = "stats")]
+                        {
+                            stats.inc_tx_t_msgs(batch.stats.t_msgs);
+                            stats.inc_tx_bytes(batch.len() as usize);
+                        }
+
+                        // Reinsert the batch into the queue
+                        pipeline.refill(batch, priority);
+                    },
+                    Ok(None) => {
+                        // The queue has been disabled: break the tx loop, drain the queue, and exit
+                        break;
+                    },
+                    Err(_) => {
+                        // A timeout occurred, no control/data messages have been sent during
+                        // the keep_alive period, we need to send a KeepAlive message
+                        let message: TransportMessage = KeepAlive.into();
+
+                        #[allow(unused_variables)] // Used when stats feature is enabled
+                        let n = link.send(&message).await?;
+
+                        #[cfg(feature = "stats")]
+                        {
+                            stats.inc_tx_t_msgs(1);
+                            stats.inc_tx_bytes(n);
+                        }
                     }
-
-                    // Reinsert the batch into the queue
-                    pipeline.refill(batch, priority);
-                } else {
-                    break
                 }
-            }
-
-            _ = interval.tick() => {
-                let message: TransportMessage = KeepAlive.into();
-
-                #[allow(unused_variables)] // Used when stats feature is enabled
-                let n = link.send(&message).await?;
-
-                #[cfg(feature = "stats")]
-                {
-                    stats.inc_tx_t_msgs(1);
-                    stats.inc_tx_bytes(n);
-                }
-            }
+            },
 
             _ = token.cancelled() => break
         }
@@ -236,7 +250,7 @@ async fn rx_task(
     where
         T: ZSliceBuffer + 'static,
         F: Fn() -> T,
-        RecyclingObject<T>: ZSliceBuffer,
+        RecyclingObject<T>: AsMut<[u8]> + ZSliceBuffer,
     {
         let batch = link
             .recv_batch(|| pool.try_take().unwrap_or_else(|| pool.alloc()))
@@ -245,14 +259,18 @@ async fn rx_task(
     }
 
     // The pool of buffers
-    let mtu = link.batch.max_buffer_size();
+    let mtu = link.config.batch.mtu as usize;
     let mut n = rx_buffer_size / mtu;
     if rx_buffer_size % mtu != 0 {
         n += 1;
     }
 
     let pool = RecyclingObjectPool::new(n, || vec![0_u8; mtu].into_boxed_slice());
-    let l = (&link.link).into();
+    let l = Link::new_unicast(
+        &link.link,
+        link.config.priorities.clone(),
+        link.config.reliability,
+    );
 
     loop {
         tokio::select! {

@@ -11,8 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use config::ConnectionRetryConf;
-use zenoh::prelude::sync::*;
+
+#![cfg(feature = "internal_config")]
+
+use zenoh::{Config, Wait};
+use zenoh_config::{ConnectionRetryConf, EndPoint, ModeDependent};
 
 #[test]
 fn retry_config_overriding() {
@@ -71,7 +74,14 @@ fn retry_config_overriding() {
         },
     ];
 
-    for (i, endpoint) in config.listen().endpoints().iter().enumerate() {
+    for (i, endpoint) in config
+        .listen()
+        .endpoints()
+        .get(config.mode().unwrap_or_default())
+        .unwrap_or(&vec![])
+        .iter()
+        .enumerate()
+    {
         let retry_config = zenoh_config::get_retry_config(&config, Some(endpoint), true);
         assert_eq!(retry_config, expected[i]);
     }
@@ -148,7 +158,7 @@ fn retry_config_infinite_period() {
         .unwrap();
 
     let endpoint: EndPoint = "tcp/[::]:0".parse().unwrap();
-    let retry_config = zenoh_config::get_retry_config(&config, Some(&endpoint), true);
+    let retry_config = &config.get_retry_config(Some(&endpoint), true);
 
     let mut period = retry_config.period();
 
@@ -165,7 +175,7 @@ fn listen_no_retry() {
         .unwrap();
 
     config.insert_json5("listen/timeout_ms", "0").unwrap();
-    zenoh::open(config).res().unwrap();
+    zenoh::open(config).wait().unwrap();
 }
 
 #[test]
@@ -178,5 +188,5 @@ fn listen_with_retry() {
 
     config.insert_json5("listen/timeout_ms", "1000").unwrap();
 
-    zenoh::open(config).res().unwrap();
+    zenoh::open(config).wait().unwrap();
 }

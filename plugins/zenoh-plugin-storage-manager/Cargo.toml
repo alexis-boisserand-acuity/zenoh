@@ -24,7 +24,7 @@ categories = { workspace = true }
 description = "The zenoh storages plugin."
 
 [features]
-default = ["dynamic_plugin", "zenoh/default", "zenoh/unstable", "zenoh/plugins"]
+default = ["dynamic_plugin"]
 dynamic_plugin = []
 
 [lib]
@@ -32,26 +32,26 @@ name = "zenoh_plugin_storage_manager"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-async-std = { workspace = true, features = ["default"] }
 async-trait = { workspace = true }
-crc = { workspace = true }
-const_format = { workspace = true }
-derive-new = { workspace = true }
-zenoh-util = {workspace = true }
-flume = { workspace = true }
+bincode = { workspace = true }
+bloomfilter = "1"
 futures = { workspace = true }
 git-version = { workspace = true }
-libloading = { workspace = true }
-tracing = {workspace = true}
-serde = { workspace = true, features = ["default"] }
+lazy_static = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-urlencoding = { workspace = true }
-zenoh = { workspace = true, features = ["unstable"] }
-zenoh-collections = { workspace = true }
-zenoh-core = { workspace = true }
-zenoh-keyexpr = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zenoh = { workspace = true, features = [
+    "default",
+    "plugins",
+    "internal",
+    "unstable",
+] }
 zenoh-plugin-trait = { workspace = true }
-zenoh-result = { workspace = true }
 zenoh_backend_traits = { workspace = true }
 
 [build-dependencies]
@@ -64,6 +64,7 @@ jsonschema = { workspace = true }
 
 [dev-dependencies]
 async-global-executor = { workspace = true }
+uhlc = { workspace = true }
 
 [package.metadata.deb]
 name = "zenoh-plugin-storage-manager"
@@ -71,4 +72,7 @@ maintainer = "zenoh-dev@eclipse.org"
 copyright = "2024 ZettaScale Technology"
 section = "net"
 license-file = ["../../LICENSE", "0"]
-depends = "zenohd (=0.11.0-dev-1)"
+depends = "zenohd (=1.0.0~dev-1)"
+
+[package.metadata.cargo-machete]
+ignored = ["git-version"]

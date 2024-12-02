@@ -16,7 +16,7 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 //!
 //! Provide different buffer implementations used for serialization and deserialization.
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -59,17 +59,21 @@ macro_rules! unsafe_slice_mut {
 #[cfg(all(not(test), not(feature = "test")))]
 #[macro_export]
 macro_rules! unsafe_slice {
-    ($s:expr,$r:expr) => {
-        unsafe { $s.get_unchecked($r) }
-    };
+    ($s:expr,$r:expr) => {{
+        let slice = &*$s;
+        let index = $r;
+        unsafe { slice.get_unchecked(index) }
+    }};
 }
 
 #[cfg(all(not(test), not(feature = "test")))]
 #[macro_export]
 macro_rules! unsafe_slice_mut {
-    ($s:expr,$r:expr) => {
-        unsafe { $s.get_unchecked_mut($r) }
-    };
+    ($s:expr,$r:expr) => {{
+        let slice = &mut *$s;
+        let index = $r;
+        unsafe { slice.get_unchecked_mut(index) }
+    }};
 }
 
 pub mod buffer {
@@ -116,8 +120,9 @@ pub mod buffer {
 }
 
 pub mod writer {
-    use crate::ZSlice;
     use core::num::NonZeroUsize;
+
+    use crate::ZSlice;
 
     #[derive(Debug, Clone, Copy)]
     pub struct DidntWrite;
@@ -136,9 +141,14 @@ pub mod writer {
         fn can_write(&self) -> bool {
             self.remaining() != 0
         }
-        /// Provides a buffer of exactly `len` uninitialized bytes to `f` to allow in-place writing.
-        /// `f` must return the number of bytes it actually wrote.
-        fn with_slot<F>(&mut self, len: usize, f: F) -> Result<NonZeroUsize, DidntWrite>
+        /// Provides a buffer of exactly `len` uninitialized bytes to `write` to allow in-place writing.
+        /// `write` must return the number of bytes it actually wrote.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure that `write` return an integer lesser than or equal to the length of
+        /// the slice passed in argument
+        unsafe fn with_slot<F>(&mut self, len: usize, write: F) -> Result<NonZeroUsize, DidntWrite>
         where
             F: FnOnce(&mut [u8]) -> usize;
     }
@@ -159,8 +169,9 @@ pub mod writer {
 }
 
 pub mod reader {
-    use crate::ZSlice;
     use core::num::NonZeroUsize;
+
+    use crate::ZSlice;
 
     #[derive(Debug, Clone, Copy)]
     pub struct DidntRead;
@@ -200,6 +211,18 @@ pub mod reader {
 
         fn mark(&mut self) -> Self::Mark;
         fn rewind(&mut self, mark: Self::Mark) -> bool;
+    }
+
+    pub trait AdvanceableReader: Reader {
+        fn skip(&mut self, offset: usize) -> Result<(), DidntRead>;
+        fn backtrack(&mut self, offset: usize) -> Result<(), DidntRead>;
+        fn advance(&mut self, offset: isize) -> Result<(), DidntRead> {
+            if offset > 0 {
+                self.skip(offset as usize)
+            } else {
+                self.backtrack((-offset) as usize)
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy)]

@@ -13,7 +13,6 @@
 mod dynamic_plugin;
 mod static_plugin;
 
-use crate::*;
 use zenoh_keyexpr::keyexpr;
 use zenoh_result::ZResult;
 use zenoh_util::LibLoader;
@@ -22,10 +21,11 @@ use self::{
     dynamic_plugin::{DynamicPlugin, DynamicPluginSource},
     static_plugin::StaticPlugin,
 };
+use crate::*;
 
 pub trait DeclaredPlugin<StartArgs, Instance>: PluginStatus {
     fn as_status(&self) -> &dyn PluginStatus;
-    fn load(&mut self) -> ZResult<&mut dyn LoadedPlugin<StartArgs, Instance>>;
+    fn load(&mut self) -> ZResult<Option<&mut dyn LoadedPlugin<StartArgs, Instance>>>;
     fn loaded(&self) -> Option<&dyn LoadedPlugin<StartArgs, Instance>>;
     fn loaded_mut(&mut self) -> Option<&mut dyn LoadedPlugin<StartArgs, Instance>>;
 }
@@ -88,7 +88,7 @@ impl<StartArgs: PluginStartArgs, Instance: PluginInstance> DeclaredPlugin<StartA
     fn as_status(&self) -> &dyn PluginStatus {
         self
     }
-    fn load(&mut self) -> ZResult<&mut dyn LoadedPlugin<StartArgs, Instance>> {
+    fn load(&mut self) -> ZResult<Option<&mut dyn LoadedPlugin<StartArgs, Instance>>> {
         self.0.load()
     }
     fn loaded(&self) -> Option<&dyn LoadedPlugin<StartArgs, Instance>> {
@@ -100,7 +100,7 @@ impl<StartArgs: PluginStartArgs, Instance: PluginInstance> DeclaredPlugin<StartA
 }
 
 /// A plugins manager that handles starting and stopping plugins.
-/// Plugins can be loaded from shared libraries using [`Self::load_plugin_by_name`] or [`Self::load_plugin_by_paths`], or added directly from the binary if available using [`Self::add_static`].
+/// Plugins can be loaded from shared libraries using [`Self::declare_dynamic_plugin_by_name`] or [`Self::declare_dynamic_plugin_by_paths`], or added directly from the binary if available using [`Self::declare_static_plugin`].
 pub struct PluginsManager<StartArgs: PluginStartArgs, Instance: PluginInstance> {
     default_lib_prefix: String,
     loader: Option<LibLoader>,
@@ -132,10 +132,10 @@ impl<StartArgs: PluginStartArgs + 'static, Instance: PluginInstance + 'static>
         P: Plugin<StartArgs = StartArgs, Instance = Instance> + Send + Sync,
         S: Into<String>,
     >(
-        mut self,
+        &mut self,
         id: S,
         required: bool,
-    ) -> Self {
+    ) {
         let id = id.into();
         let plugin_loader: StaticPlugin<StartArgs, Instance, P> =
             StaticPlugin::new(id.clone(), required);
@@ -152,7 +152,6 @@ impl<StartArgs: PluginStartArgs + 'static, Instance: PluginInstance + 'static>
             self.plugins.last().unwrap().id(),
             self.plugins.last().unwrap().name()
         );
-        self
     }
 
     /// Add dynamic plugin to the manager by name, automatically prepending the default library prefix
