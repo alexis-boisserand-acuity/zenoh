@@ -303,16 +303,22 @@ impl LinkManagerMulticastUdp {
                 IpAddr::V6(src_ip6) => bail!("{}: unexpected IPv6 source address", src_ip6),
             },
             IpAddr::V6(dst_ip6) => {
-                // Join default multicast group
-                mcast_sock
-                    .join_multicast_v6(&dst_ip6, 0)
-                    .map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
-                // Join any additional multicast group
-                for g in join {
-                    let g: Ipv6Addr = g.parse().map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
-                    mcast_sock
-                        .join_multicast_v6(&g, 0)
-                        .map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
+                match zenoh_util::net::get_index_of_interface(local_addr) {
+                    Ok(interface) => {
+                        // Join default multicast group
+                        mcast_sock
+                            .join_multicast_v6(&dst_ip6, interface)
+                            .map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
+                        // Join any additional multicast group
+                        for g in join {
+                            let g: Ipv6Addr =
+                                g.parse().map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
+                            mcast_sock
+                                .join_multicast_v6(&g, interface)
+                                .map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
+                        }
+                    }
+                    Err(_) => bail!("{}: no index found for this local IPv6 interface", local_addr),
                 }
             }
         };
