@@ -318,7 +318,10 @@ impl LinkManagerMulticastUdp {
                                 .map_err(|e| zerror!("{}: {}", mcast_addr, e))?;
                         }
                     }
-                    Err(_) => bail!("{}: no index found for this local IPv6 interface", local_addr),
+                    Err(_) => bail!(
+                        "{}: no index found for this local IPv6 interface",
+                        local_addr
+                    ),
                 }
             }
         };
