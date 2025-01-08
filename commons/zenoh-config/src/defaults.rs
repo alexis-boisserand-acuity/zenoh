@@ -95,6 +95,15 @@ pub mod scouting {
     pub mod gossip {
         pub const enabled: bool = true;
         pub const multihop: bool = false;
+        pub mod target {
+            pub const router: &crate::WhatAmIMatcher = // "router|peer"
+                &crate::WhatAmIMatcher::empty().router().peer();
+            pub const peer: &crate::WhatAmIMatcher = // "router|peer"
+                &crate::WhatAmIMatcher::empty().router().peer();
+            pub const client: &crate::WhatAmIMatcher = // ""
+                &crate::WhatAmIMatcher::empty();
+            mode_accessor!(crate::WhatAmIMatcher);
+        }
         pub mod autoconnect {
             pub const router: &crate::WhatAmIMatcher = // ""
                 &crate::WhatAmIMatcher::empty();
@@ -140,8 +149,14 @@ impl Default for ListenConfig {
         Self {
             timeout_ms: None,
             endpoints: ModeDependentValue::Dependent(ModeValues {
+                #[cfg(feature = "transport_tcp")]
                 router: Some(vec!["tcp/[::]:7447".parse().unwrap()]),
+                #[cfg(not(feature = "transport_tcp"))]
+                router: Some(vec![]),
+                #[cfg(feature = "transport_tcp")]
                 peer: Some(vec!["tcp/[::]:0".parse().unwrap()]),
+                #[cfg(not(feature = "transport_tcp"))]
+                peer: Some(vec![]),
                 client: None,
             }),
             exit_on_failure: None,
@@ -165,6 +180,7 @@ impl Default for ConnectConfig {
 impl Default for TransportUnicastConf {
     fn default() -> Self {
         Self {
+            open_timeout: 10_000,
             accept_timeout: 10_000,
             accept_pending: 100,
             max_sessions: 1_000,

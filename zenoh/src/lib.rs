@@ -81,6 +81,21 @@ extern crate zenoh_result;
 mod api;
 mod net;
 
+#[cfg(feature = "internal")]
+pub use api::admin::KE_ADV_PREFIX;
+#[cfg(feature = "internal")]
+pub use api::admin::KE_AT;
+#[cfg(feature = "internal")]
+pub use api::admin::KE_EMPTY;
+#[cfg(feature = "internal")]
+pub use api::admin::KE_PUB;
+#[cfg(feature = "internal")]
+pub use api::admin::KE_STAR;
+#[cfg(feature = "internal")]
+pub use api::admin::KE_STARSTAR;
+#[cfg(feature = "internal")]
+pub use api::admin::KE_SUB;
+
 lazy_static::lazy_static!(
     static ref LONG_VERSION: String = format!("{} built with {}", GIT_VERSION, env!("RUSTC_VERSION"));
 );
@@ -172,7 +187,7 @@ pub mod key_expr {
     #[zenoh_macros::unstable]
     pub mod format {
         pub use zenoh_keyexpr::format::*;
-        pub use zenoh_macros::{kedefine, keformat, kewrite};
+        pub use zenoh_macros::{ke, kedefine, keformat, kewrite};
         pub mod macro_support {
             pub use zenoh_keyexpr::format::macro_support::*;
         }
@@ -193,6 +208,7 @@ pub mod session {
     pub use crate::api::builders::session::{init, InitBuilder};
     pub use crate::api::{
         builders::{
+            close::CloseBuilder,
             info::{PeersZenohIdBuilder, RoutersZenohIdBuilder, ZenohIdBuilder},
             publisher::{SessionDeleteBuilder, SessionPutBuilder},
             query::SessionGetBuilder,
@@ -247,11 +263,6 @@ pub mod bytes {
 /// declared by a [`Session::declare_subscriber`](crate::Session::declare_subscriber)
 ///
 pub mod pubsub {
-    #[zenoh_macros::unstable]
-    pub use crate::api::{
-        builders::matching_listener::MatchingListenerBuilder,
-        publisher::{MatchingListener, MatchingListenerUndeclaration, MatchingStatus},
-    };
     pub use crate::api::{
         builders::{
             publisher::{
@@ -279,6 +290,13 @@ pub mod query {
 
     #[zenoh_macros::internal]
     pub use crate::api::queryable::ReplySample;
+    #[zenoh_macros::unstable]
+    pub use crate::api::{
+        builders::querier::{QuerierBuilder, QuerierGetBuilder},
+        querier::Querier,
+        query::ReplyKeyExpr,
+        selector::ZenohParameters,
+    };
     pub use crate::api::{
         builders::{
             queryable::QueryableBuilder,
@@ -288,8 +306,14 @@ pub mod query {
         queryable::{Query, Queryable, QueryableUndeclaration},
         selector::Selector,
     };
-    #[zenoh_macros::unstable]
-    pub use crate::api::{query::ReplyKeyExpr, selector::ZenohParameters};
+}
+
+#[zenoh_macros::unstable]
+pub mod matching {
+    pub use crate::api::{
+        builders::matching_listener::MatchingListenerBuilder,
+        matching::{MatchingListener, MatchingListenerUndeclaration, MatchingStatus},
+    };
 }
 
 /// Callback handler trait.
@@ -362,7 +386,7 @@ pub mod scouting {
 /// Liveliness primitives
 ///
 /// A [`LivelinessToken`](liveliness::LivelinessToken) is a token which liveliness is tied
-/// to the Zenoh [`Session`](Session) and can be monitored by remote applications.
+/// to the Zenoh [`Session`] and can be monitored by remote applications.
 ///
 /// # Examples
 /// ### Declaring a token
@@ -410,7 +434,6 @@ pub mod scouting {
 /// }
 /// # }
 /// ```
-#[zenoh_macros::unstable]
 pub mod liveliness {
     pub use crate::api::liveliness::{
         Liveliness, LivelinessGetBuilder, LivelinessSubscriberBuilder, LivelinessToken,

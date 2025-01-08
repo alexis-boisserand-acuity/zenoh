@@ -43,11 +43,25 @@ use super::{
     resource::{QueryRoute, QueryRoutes, QueryTargetQablSet, Resource},
     tables::{NodeId, RoutingExpr, Tables, TablesLock},
 };
+#[cfg(feature = "unstable")]
+use crate::key_expr::KeyExpr;
 use crate::net::routing::hat::{HatTrait, SendDeclare};
 
 pub(crate) struct Query {
     src_face: Arc<FaceState>,
     src_qid: RequestId,
+}
+
+#[zenoh_macros::unstable]
+#[inline]
+pub(crate) fn get_matching_queryables(
+    tables: &Tables,
+    key_expr: &KeyExpr<'_>,
+    complete: bool,
+) -> HashMap<usize, Arc<FaceState>> {
+    tables
+        .hat_code
+        .get_matching_queryables(tables, key_expr, complete)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +95,7 @@ pub(crate) fn declare_queryable(
                     let wtables = zwrite!(tables.tables);
                     (res.unwrap(), wtables)
                 } else {
-                    let mut fullexpr = prefix.expr();
+                    let mut fullexpr = prefix.expr().to_string();
                     fullexpr.push_str(expr.suffix.as_ref());
                     let mut matches = keyexpr::new(fullexpr.as_str())
                         .map(|ke| Resource::get_matches(&rtables, ke))

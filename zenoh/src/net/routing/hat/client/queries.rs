@@ -33,15 +33,18 @@ use zenoh_protocol::{
 use zenoh_sync::get_mut_unchecked;
 
 use super::{face_hat, face_hat_mut, get_routes_entries, HatCode, HatFace};
-use crate::net::routing::{
-    dispatcher::{
-        face::FaceState,
-        resource::{NodeId, Resource, SessionContext},
-        tables::{QueryTargetQabl, QueryTargetQablSet, RoutingExpr, Tables},
+use crate::{
+    key_expr::KeyExpr,
+    net::routing::{
+        dispatcher::{
+            face::FaceState,
+            resource::{NodeId, Resource, SessionContext},
+            tables::{QueryTargetQabl, QueryTargetQablSet, RoutingExpr, Tables},
+        },
+        hat::{HatQueriesTrait, SendDeclare, Sources},
+        router::{update_query_routes_from, RoutesIndexes},
+        RoutingContext,
     },
-    hat::{HatQueriesTrait, SendDeclare, Sources},
-    router::RoutesIndexes,
-    RoutingContext,
 };
 
 #[inline]
@@ -118,7 +121,7 @@ fn propagate_simple_queryable(
                             ext_info: info,
                         }),
                     },
-                    res.expr(),
+                    res.expr().to_string(),
                 ),
             );
         }
@@ -191,7 +194,7 @@ fn propagate_forget_simple_queryable(
                             ext_wire_expr: WireExprType::null(),
                         }),
                     },
-                    res.expr(),
+                    res.expr().to_string(),
                 ),
             );
         }
@@ -235,7 +238,7 @@ pub(super) fn undeclare_simple_queryable(
                                 ext_wire_expr: WireExprType::null(),
                             }),
                         },
-                        res.expr(),
+                        res.expr().to_string(),
                     ),
                 );
             }
@@ -272,6 +275,8 @@ pub(super) fn queries_new_face(
             propagate_simple_queryable(tables, qabl, Some(&mut face.clone()), send_declare);
         }
     }
+    // recompute routes
+    update_query_routes_from(tables, &mut tables.root_res.clone());
 }
 
 lazy_static::lazy_static! {
@@ -322,6 +327,25 @@ impl HatQueriesTrait for HatCode {
         Vec::from_iter(qabls)
     }
 
+    fn get_queriers(&self, tables: &Tables) -> Vec<(Arc<Resource>, Sources)> {
+        let mut result = HashMap::new();
+        for face in tables.faces.values() {
+            for interest in face_hat!(face).remote_interests.values() {
+                if interest.options.queryables() {
+                    if let Some(res) = interest.res.as_ref() {
+                        let sources = result.entry(res.clone()).or_insert_with(Sources::default);
+                        match face.whatami {
+                            WhatAmI::Router => sources.routers.push(face.zid),
+                            WhatAmI::Peer => sources.peers.push(face.zid),
+                            WhatAmI::Client => sources.clients.push(face.zid),
+                        }
+                    }
+                }
+            }
+        }
+        result.into_iter().collect()
+    }
+
     fn compute_query_route(
         &self,
         tables: &Tables,
@@ -349,12 +373,30 @@ impl HatQueriesTrait for HatCode {
         };
 
         if source_type == WhatAmI::Client {
-            if let Some(face) = tables.faces.values().find(|f| f.whatami != WhatAmI::Client) {
-                let key_expr = Resource::get_best_key(expr.prefix, expr.suffix, face.id);
-                route.push(QueryTargetQabl {
-                    direction: (face.clone(), key_expr.to_owned(), NodeId::default()),
-                    info: None,
-                });
+            for face in tables
+                .faces
+                .values()
+                .filter(|f| f.whatami != WhatAmI::Client)
+            {
+                if !face.local_interests.values().any(|interest| {
+                    interest.finalized
+                        && interest.options.queryables()
+                        && interest
+                            .res
+                            .as_ref()
+                            .map(|res| KeyExpr::keyexpr_include(res.expr(), expr.full_expr()))
+                            .unwrap_or(true)
+                }) || face_hat!(face)
+                    .remote_qabls
+                    .values()
+                    .any(|qbl| KeyExpr::keyexpr_intersect(qbl.expr(), expr.full_expr()))
+                {
+                    let key_expr = Resource::get_best_key(expr.prefix, expr.suffix, face.id);
+                    route.push(QueryTargetQabl {
+                        direction: (face.clone(), key_expr.to_owned(), NodeId::default()),
+                        info: None,
+                    });
+                }
             }
         }
 
@@ -387,5 +429,80 @@ impl HatQueriesTrait for HatCode {
 
     fn get_query_routes_entries(&self, _tables: &Tables) -> RoutesIndexes {
         get_routes_entries()
+    }
+
+    #[cfg(feature = "unstable")]
+    fn get_matching_queryables(
+        &self,
+        tables: &Tables,
+        key_expr: &KeyExpr<'_>,
+        complete: bool,
+    ) -> HashMap<usize, Arc<FaceState>> {
+        let mut matching_queryables = HashMap::new();
+        if key_expr.ends_with('/') {
+            return matching_queryables;
+        }
+        tracing::trace!(
+            "get_matching_queryables({}; complete: {})",
+            key_expr,
+            complete
+        );
+        for face in tables
+            .faces
+            .values()
+            .filter(|f| f.whatami != WhatAmI::Client)
+        {
+            if face.local_interests.values().any(|interest| {
+                interest.finalized
+                    && interest.options.queryables()
+                    && interest
+                        .res
+                        .as_ref()
+                        .map(|res| KeyExpr::keyexpr_include(res.expr(), key_expr))
+                        .unwrap_or(true)
+            }) && face_hat!(face)
+                .remote_qabls
+                .values()
+                .any(|qbl| match complete {
+                    true => {
+                        qbl.session_ctxs
+                            .get(&face.id)
+                            .and_then(|sc| sc.qabl)
+                            .map_or(false, |q| q.complete)
+                            && KeyExpr::keyexpr_include(qbl.expr(), key_expr)
+                    }
+                    false => KeyExpr::keyexpr_intersect(qbl.expr(), key_expr),
+                })
+            {
+                matching_queryables.insert(face.id, face.clone());
+            }
+        }
+
+        let res = Resource::get_resource(&tables.root_res, key_expr);
+        let matches = res
+            .as_ref()
+            .and_then(|res| res.context.as_ref())
+            .map(|ctx| Cow::from(&ctx.matches))
+            .unwrap_or_else(|| Cow::from(Resource::get_matches(tables, key_expr)));
+
+        for mres in matches.iter() {
+            let mres = mres.upgrade().unwrap();
+            if complete && !KeyExpr::keyexpr_include(mres.expr(), key_expr) {
+                continue;
+            }
+            for (sid, context) in &mres.session_ctxs {
+                if context.face.whatami == WhatAmI::Client
+                    && match complete {
+                        true => context.qabl.map_or(false, |q| q.complete),
+                        false => context.qabl.is_some(),
+                    }
+                {
+                    matching_queryables
+                        .entry(*sid)
+                        .or_insert_with(|| context.face.clone());
+                }
+            }
+        }
+        matching_queryables
     }
 }

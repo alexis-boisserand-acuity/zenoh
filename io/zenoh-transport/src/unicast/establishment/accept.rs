@@ -61,6 +61,7 @@ struct StateTransport {
     #[cfg(feature = "shared-memory")]
     ext_shm: ext::shm::StateAccept,
     ext_lowlatency: ext::lowlatency::StateAccept,
+    ext_patch: ext::patch::StateAccept,
 }
 
 #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
@@ -143,6 +144,7 @@ struct AcceptLink<'a> {
     ext_lowlatency: ext::lowlatency::LowLatencyFsm<'a>,
     #[cfg(feature = "transport_compression")]
     ext_compression: ext::compression::CompressionFsm<'a>,
+    ext_patch: ext::patch::PatchFsm<'a>,
 }
 
 #[async_trait]
@@ -268,6 +270,12 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
+        // Extension Patch
+        self.ext_patch
+            .recv_init_syn((&mut state.transport.ext_patch, init_syn.ext_patch))
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         let output = RecvInitSynOut {
             other_zid: init_syn.zid,
             other_whatami: init_syn.whatami,
@@ -330,7 +338,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
-        // Extension MultiLink
+        // Extension Compression
         let ext_compression = zcondfeat!(
             "transport_compression",
             self.ext_compression
@@ -340,40 +348,52 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             None
         );
 
-        // Create the cookie
-        let cookie_nonce: u64 = zasynclock!(self.prng).gen();
-        let cookie = Cookie {
-            zid: input.other_zid,
-            whatami: input.other_whatami,
-            resolution: state.transport.resolution,
-            batch_size: state.transport.batch_size,
-            nonce: cookie_nonce,
-            ext_qos: state.transport.ext_qos,
-            #[cfg(feature = "transport_multilink")]
-            ext_mlink: state.transport.ext_mlink,
-            #[cfg(feature = "shared-memory")]
-            ext_shm: state.transport.ext_shm,
-            #[cfg(feature = "transport_auth")]
-            ext_auth: state.link.ext_auth,
-            ext_lowlatency: state.transport.ext_lowlatency,
-            #[cfg(feature = "transport_compression")]
-            ext_compression: state.link.ext_compression,
-        };
+        // Extension Patch
+        let ext_patch = self
+            .ext_patch
+            .send_init_ack(&state.transport.ext_patch)
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
-        let mut encrypted = vec![];
-        let mut writer = encrypted.writer();
-        let mut codec = Zenoh080Cookie {
-            prng: &mut *zasynclock!(self.prng),
-            cipher: self.cipher,
-            codec: Zenoh080::new(),
+        // Create the cookie
+        let (cookie, cookie_nonce): (ZSlice, u64) = {
+            let mut prng = zasynclock!(self.prng);
+
+            let nonce: u64 = prng.gen();
+            let cookie = Cookie {
+                zid: input.other_zid,
+                whatami: input.other_whatami,
+                resolution: state.transport.resolution,
+                batch_size: state.transport.batch_size,
+                nonce,
+                ext_qos: state.transport.ext_qos,
+                #[cfg(feature = "transport_multilink")]
+                ext_mlink: state.transport.ext_mlink,
+                #[cfg(feature = "shared-memory")]
+                ext_shm: state.transport.ext_shm,
+                #[cfg(feature = "transport_auth")]
+                ext_auth: state.link.ext_auth,
+                ext_lowlatency: state.transport.ext_lowlatency,
+                #[cfg(feature = "transport_compression")]
+                ext_compression: state.link.ext_compression,
+                ext_patch: state.transport.ext_patch,
+            };
+
+            let mut encrypted = vec![];
+            let mut writer = encrypted.writer();
+            let mut codec = Zenoh080Cookie {
+                prng: &mut prng,
+                cipher: self.cipher,
+                codec: Zenoh080::new(),
+            };
+            codec.write(&mut writer, &cookie).map_err(|_| {
+                (
+                    zerror!("Encoding cookie failed").into(),
+                    Some(close::reason::INVALID),
+                )
+            })?;
+            (encrypted.into(), nonce)
         };
-        codec.write(&mut writer, &cookie).map_err(|_| {
-            (
-                zerror!("Encoding cookie failed").into(),
-                Some(close::reason::INVALID),
-            )
-        })?;
-        let cookie: ZSlice = encrypted.into();
 
         // Send the message on the link
         let msg: TransportMessage = InitAck {
@@ -391,6 +411,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_patch,
         }
         .into();
 
@@ -460,8 +481,9 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
 
         // Decrypt the cookie with the cipher
         let cookie: Cookie = {
+            let mut prng = zasynclock!(self.prng);
             let mut codec = Zenoh080Cookie {
-                prng: &mut *zasynclock!(self.prng),
+                prng: &mut prng,
                 cipher: self.cipher,
                 codec: Zenoh080::new(),
             };
@@ -491,6 +513,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
                 #[cfg(feature = "shared-memory")]
                 ext_shm: cookie.ext_shm,
                 ext_lowlatency: cookie.ext_lowlatency,
+                ext_patch: cookie.ext_patch,
             },
             #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
             link: StateLink {
@@ -681,6 +704,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         ext_lowlatency: ext::lowlatency::LowLatencyFsm::new(),
         #[cfg(feature = "transport_compression")]
         ext_compression: ext::compression::CompressionFsm::new(),
+        ext_patch: ext::patch::PatchFsm::new(),
     };
 
     // Init handshake
@@ -703,36 +727,38 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
     let batch_size = manager.config.batch_size.min(batch_size::UNICAST).min(mtu);
 
     let iack_out = {
-        let mut state = State {
-            transport: StateTransport {
-                batch_size,
-                resolution: manager.config.resolution,
-                ext_qos: ext::qos::StateAccept::new(manager.config.unicast.is_qos, &endpoint)?,
-                #[cfg(feature = "transport_multilink")]
-                ext_mlink: manager
-                    .state
-                    .unicast
-                    .multilink
-                    .accept(manager.config.unicast.max_links > 1),
-                #[cfg(feature = "shared-memory")]
-                ext_shm: ext::shm::StateAccept::new(),
-                ext_lowlatency: ext::lowlatency::StateAccept::new(
-                    manager.config.unicast.is_lowlatency,
-                ),
-            },
-            #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
-            link: StateLink {
-                #[cfg(feature = "transport_auth")]
-                ext_auth: manager
-                    .state
-                    .unicast
-                    .authenticator
-                    .accept(&mut *zasynclock!(manager.prng)),
-                #[cfg(feature = "transport_compression")]
-                ext_compression: ext::compression::StateAccept::new(
-                    manager.config.unicast.is_compression,
-                ),
-            },
+        let mut state = {
+            #[cfg(feature = "transport_auth")]
+            let mut prng = zasynclock!(manager.prng);
+
+            State {
+                transport: StateTransport {
+                    batch_size,
+                    resolution: manager.config.resolution,
+                    ext_qos: ext::qos::StateAccept::new(manager.config.unicast.is_qos, &endpoint)?,
+                    #[cfg(feature = "transport_multilink")]
+                    ext_mlink: manager
+                        .state
+                        .unicast
+                        .multilink
+                        .accept(manager.config.unicast.max_links > 1),
+                    #[cfg(feature = "shared-memory")]
+                    ext_shm: ext::shm::StateAccept::new(),
+                    ext_lowlatency: ext::lowlatency::StateAccept::new(
+                        manager.config.unicast.is_lowlatency,
+                    ),
+                    ext_patch: ext::patch::StateAccept::new(),
+                },
+                #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
+                link: StateLink {
+                    #[cfg(feature = "transport_auth")]
+                    ext_auth: manager.state.unicast.authenticator.accept(&mut *prng),
+                    #[cfg(feature = "transport_compression")]
+                    ext_compression: ext::compression::StateAccept::new(
+                        manager.config.unicast.is_compression,
+                    ),
+                },
+            }
         };
 
         // Let's scope the Init phase in such a way memory is freed by Rust
@@ -786,6 +812,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         is_lowlatency: state.transport.ext_lowlatency.is_lowlatency(),
         #[cfg(feature = "auth_usrpwd")]
         auth_id: osyn_out.other_auth_id,
+        patch: state.transport.ext_patch.get(),
     };
 
     let a_config = TransportLinkUnicastConfig {

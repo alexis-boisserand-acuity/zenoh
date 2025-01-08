@@ -53,7 +53,7 @@ zconfigurable! {
     pub static ref TREES_COMPUTATION_DELAY_MS: u64 = 100;
 }
 
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 pub(crate) struct Sources {
     routers: Vec<ZenohIdProto>,
     peers: Vec<ZenohIdProto>,
@@ -78,7 +78,7 @@ pub(crate) trait HatTrait:
 }
 
 pub(crate) trait HatBaseTrait {
-    fn init(&self, tables: &mut Tables, runtime: Runtime);
+    fn init(&self, tables: &mut Tables, runtime: Runtime) -> ZResult<()>;
 
     fn new_tables(&self, router_peers_failover_brokering: bool) -> Box<dyn Any + Send + Sync>;
 
@@ -181,6 +181,8 @@ pub(crate) trait HatPubSubTrait {
 
     fn get_subscriptions(&self, tables: &Tables) -> Vec<(Arc<Resource>, Sources)>;
 
+    fn get_publications(&self, tables: &Tables) -> Vec<(Arc<Resource>, Sources)>;
+
     fn compute_data_route(
         &self,
         tables: &Tables,
@@ -223,6 +225,8 @@ pub(crate) trait HatQueriesTrait {
 
     fn get_queryables(&self, tables: &Tables) -> Vec<(Arc<Resource>, Sources)>;
 
+    fn get_queriers(&self, tables: &Tables) -> Vec<(Arc<Resource>, Sources)>;
+
     fn compute_query_route(
         &self,
         tables: &Tables,
@@ -232,6 +236,14 @@ pub(crate) trait HatQueriesTrait {
     ) -> Arc<QueryTargetQablSet>;
 
     fn get_query_routes_entries(&self, tables: &Tables) -> RoutesIndexes;
+
+    #[zenoh_macros::unstable]
+    fn get_matching_queryables(
+        &self,
+        tables: &Tables,
+        key_expr: &KeyExpr<'_>,
+        complete: bool,
+    ) -> HashMap<usize, Arc<FaceState>>;
 }
 
 pub(crate) fn new_hat(whatami: WhatAmI, config: &Config) -> Box<dyn HatTrait + Send + Sync> {

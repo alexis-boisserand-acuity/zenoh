@@ -13,10 +13,13 @@
 //
 use std::future::{IntoFuture, Ready};
 
+use itertools::Itertools;
+use zenoh_config::qos::PublisherQoSConfig;
 use zenoh_core::{Resolvable, Result as ZResult, Wait};
+use zenoh_keyexpr::keyexpr_tree::{IKeyExprTree, IKeyExprTreeNode};
+use zenoh_protocol::core::CongestionControl;
 #[cfg(feature = "unstable")]
 use zenoh_protocol::core::Reliability;
-use zenoh_protocol::{core::CongestionControl, network::Mapping};
 
 #[cfg(feature = "unstable")]
 use crate::api::sample::SourceInfo;
@@ -204,7 +207,8 @@ impl<P, T> Resolvable for PublicationBuilder<P, T> {
 
 impl Wait for PublicationBuilder<PublisherBuilder<'_, '_>, PublicationBuilderPut> {
     #[inline]
-    fn wait(self) -> <Self as Resolvable>::To {
+    fn wait(mut self) -> <Self as Resolvable>::To {
+        self.publisher = self.publisher.apply_qos_overwrites();
         self.publisher.session.0.resolve_put(
             &self.publisher.key_expr?,
             self.kind.payload,
@@ -226,7 +230,8 @@ impl Wait for PublicationBuilder<PublisherBuilder<'_, '_>, PublicationBuilderPut
 
 impl Wait for PublicationBuilder<PublisherBuilder<'_, '_>, PublicationBuilderDelete> {
     #[inline]
-    fn wait(self) -> <Self as Resolvable>::To {
+    fn wait(mut self) -> <Self as Resolvable>::To {
+        self.publisher = self.publisher.apply_qos_overwrites();
         self.publisher.session.0.resolve_put(
             &self.publisher.key_expr?,
             ZBytes::new(),
@@ -283,14 +288,41 @@ impl IntoFuture for PublicationBuilder<PublisherBuilder<'_, '_>, PublicationBuil
 #[must_use = "Resolvables do nothing unless you resolve them using `.await` or `zenoh::Wait::wait`"]
 #[derive(Debug)]
 pub struct PublisherBuilder<'a, 'b> {
+    #[cfg(feature = "internal")]
+    pub session: &'a Session,
+    #[cfg(not(feature = "internal"))]
     pub(crate) session: &'a Session,
+
+    #[cfg(feature = "internal")]
+    pub key_expr: ZResult<KeyExpr<'b>>,
+    #[cfg(not(feature = "internal"))]
     pub(crate) key_expr: ZResult<KeyExpr<'b>>,
+
+    #[cfg(feature = "internal")]
+    pub encoding: Encoding,
+    #[cfg(not(feature = "internal"))]
     pub(crate) encoding: Encoding,
+    #[cfg(feature = "internal")]
+    pub congestion_control: CongestionControl,
+    #[cfg(not(feature = "internal"))]
     pub(crate) congestion_control: CongestionControl,
+    #[cfg(feature = "internal")]
+    pub priority: Priority,
+    #[cfg(not(feature = "internal"))]
     pub(crate) priority: Priority,
+    #[cfg(feature = "internal")]
+    pub is_express: bool,
+    #[cfg(not(feature = "internal"))]
     pub(crate) is_express: bool,
+    #[cfg(feature = "internal")]
+    #[cfg(feature = "unstable")]
+    pub reliability: Reliability,
+    #[cfg(not(feature = "internal"))]
     #[cfg(feature = "unstable")]
     pub(crate) reliability: Reliability,
+    #[cfg(feature = "internal")]
+    pub destination: Locality,
+    #[cfg(not(feature = "internal"))]
     pub(crate) destination: Locality,
 }
 
@@ -341,6 +373,58 @@ impl QoSBuilderTrait for PublisherBuilder<'_, '_> {
 }
 
 impl PublisherBuilder<'_, '_> {
+    /// Looks up if any configured QoS overwrites apply on the builder's key expression.
+    /// Returns a new builder with the overwritten QoS parameters.
+    pub(crate) fn apply_qos_overwrites(self) -> Self {
+        let mut qos_overwrites = PublisherQoSConfig::default();
+        if let Ok(key_expr) = &self.key_expr {
+            // get overwritten builder
+            let state = zread!(self.session.0.state);
+            let nodes_including = state
+                .publisher_qos_tree
+                .nodes_including(key_expr)
+                .collect_vec();
+            for node in &nodes_including {
+                // Take the first one yielded by the iterator that has overwrites
+                if let Some(overwrites) = node.weight() {
+                    qos_overwrites = overwrites.clone();
+                    // log warning if multiple keyexprs include it
+                    if nodes_including.len() > 1 {
+                        tracing::warn!(
+                            "Publisher declared on `{}` which is included by multiple key_exprs in qos config. Using qos config for `{}`",
+                            key_expr,
+                            node.keyexpr(),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        Self {
+            congestion_control: qos_overwrites
+                .congestion_control
+                .map(|cc| cc.into())
+                .unwrap_or(self.congestion_control),
+            priority: qos_overwrites
+                .priority
+                .map(|p| p.into())
+                .unwrap_or(self.priority),
+            is_express: qos_overwrites.express.unwrap_or(self.is_express),
+            #[cfg(feature = "unstable")]
+            reliability: qos_overwrites
+                .reliability
+                .map(|r| r.into())
+                .unwrap_or(self.reliability),
+            #[cfg(feature = "unstable")]
+            destination: qos_overwrites
+                .allowed_destination
+                .map(|d| d.into())
+                .unwrap_or(self.destination),
+            ..self
+        }
+    }
+
     /// Changes the [`crate::sample::Locality`] applied when routing the data.
     ///
     /// This restricts the matching subscribers that will receive the published data to the ones
@@ -372,37 +456,11 @@ impl<'b> Resolvable for PublisherBuilder<'_, 'b> {
 }
 
 impl Wait for PublisherBuilder<'_, '_> {
-    fn wait(self) -> <Self as Resolvable>::To {
+    fn wait(mut self) -> <Self as Resolvable>::To {
+        self = self.apply_qos_overwrites();
         let mut key_expr = self.key_expr?;
         if !key_expr.is_fully_optimized(&self.session.0) {
-            let session_id = self.session.0.id;
-            let expr_id = self.session.0.declare_prefix(key_expr.as_str()).wait()?;
-            let prefix_len = key_expr
-                .len()
-                .try_into()
-                .expect("How did you get a key expression with a length over 2^32!?");
-            key_expr = match key_expr.0 {
-                crate::api::key_expr::KeyExprInner::Borrowed(key_expr)
-                | crate::api::key_expr::KeyExprInner::BorrowedWire { key_expr, .. } => {
-                    KeyExpr(crate::api::key_expr::KeyExprInner::BorrowedWire {
-                        key_expr,
-                        expr_id,
-                        mapping: Mapping::Sender,
-                        prefix_len,
-                        session_id,
-                    })
-                }
-                crate::api::key_expr::KeyExprInner::Owned(key_expr)
-                | crate::api::key_expr::KeyExprInner::Wire { key_expr, .. } => {
-                    KeyExpr(crate::api::key_expr::KeyExprInner::Wire {
-                        key_expr,
-                        expr_id,
-                        mapping: Mapping::Sender,
-                        prefix_len,
-                        session_id,
-                    })
-                }
-            }
+            key_expr = self.session.declare_keyexpr(key_expr).wait()?;
         }
         let id = self
             .session

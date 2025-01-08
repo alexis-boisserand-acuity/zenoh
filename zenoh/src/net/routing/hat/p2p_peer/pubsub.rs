@@ -78,7 +78,7 @@ fn propagate_simple_subscription_to(
                             wire_expr: key_expr,
                         }),
                     },
-                    res.expr(),
+                    res.expr().to_string(),
                 ),
             );
         } else {
@@ -118,7 +118,7 @@ fn propagate_simple_subscription_to(
                                     wire_expr: key_expr,
                                 }),
                             },
-                            res.expr(),
+                            res.expr().to_string(),
                         ),
                     );
                 }
@@ -206,10 +206,10 @@ fn declare_simple_subscription(
                             ext_nodeid: ext::NodeIdType::DEFAULT,
                             body: DeclareBody::DeclareSubscriber(DeclareSubscriber {
                                 id: 0, // @TODO use proper SubscriberId
-                                wire_expr: res.expr().into(),
+                                wire_expr: res.expr().to_string().into(),
                             }),
                         },
-                        res.expr(),
+                        res.expr().to_string(),
                     ))
             }
         }
@@ -257,7 +257,7 @@ fn propagate_forget_simple_subscription(
                             ext_wire_expr: WireExprType::null(),
                         }),
                     },
-                    res.expr(),
+                    res.expr().to_string(),
                 ),
             );
         }
@@ -285,7 +285,7 @@ fn propagate_forget_simple_subscription(
                                     ext_wire_expr: WireExprType::null(),
                                 }),
                             },
-                            res.expr(),
+                            res.expr().to_string(),
                         ),
                     );
                 }
@@ -326,7 +326,7 @@ pub(super) fn undeclare_simple_subscription(
                                 ext_wire_expr: WireExprType::null(),
                             }),
                         },
-                        res.expr(),
+                        res.expr().to_string(),
                     ),
                 );
             }
@@ -354,7 +354,7 @@ pub(super) fn undeclare_simple_subscription(
                                         ext_wire_expr: WireExprType::null(),
                                     }),
                                 },
-                                res.expr(),
+                                res.expr().to_string(),
                             ),
                         );
                     }
@@ -459,7 +459,7 @@ pub(super) fn declare_sub_interest(
                                     wire_expr,
                                 }),
                             },
-                            res.expr(),
+                            res.expr().to_string(),
                         ),
                     );
                 }
@@ -488,7 +488,7 @@ pub(super) fn declare_sub_interest(
                                                 DeclareSubscriber { id, wire_expr },
                                             ),
                                         },
-                                        sub.expr(),
+                                        sub.expr().to_string(),
                                     ),
                                 );
                             }
@@ -521,7 +521,7 @@ pub(super) fn declare_sub_interest(
                                         wire_expr,
                                     }),
                                 },
-                                sub.expr(),
+                                sub.expr().to_string(),
                             ),
                         );
                     }
@@ -575,6 +575,25 @@ impl HatPubSubTrait for HatCode {
         Vec::from_iter(subs)
     }
 
+    fn get_publications(&self, tables: &Tables) -> Vec<(Arc<Resource>, Sources)> {
+        let mut result = HashMap::new();
+        for face in tables.faces.values() {
+            for interest in face_hat!(face).remote_interests.values() {
+                if interest.options.subscribers() {
+                    if let Some(res) = interest.res.as_ref() {
+                        let sources = result.entry(res.clone()).or_insert_with(Sources::default);
+                        match face.whatami {
+                            WhatAmI::Router => sources.routers.push(face.zid),
+                            WhatAmI::Peer => sources.peers.push(face.zid),
+                            WhatAmI::Client => sources.clients.push(face.zid),
+                        }
+                    }
+                }
+            }
+        }
+        result.into_iter().collect()
+    }
+
     fn compute_data_route(
         &self,
         tables: &Tables,
@@ -607,37 +626,19 @@ impl HatPubSubTrait for HatCode {
                 .values()
                 .filter(|f| f.whatami == WhatAmI::Router)
             {
-                if face.local_interests.values().any(|interest| {
+                if !face.local_interests.values().any(|interest| {
                     interest.finalized
                         && interest.options.subscribers()
                         && interest
                             .res
                             .as_ref()
-                            .map(|res| {
-                                KeyExpr::try_from(res.expr())
-                                    .and_then(|intres| {
-                                        KeyExpr::try_from(expr.full_expr())
-                                            .map(|putres| intres.includes(&putres))
-                                    })
-                                    .unwrap_or(false)
-                            })
+                            .map(|res| KeyExpr::keyexpr_include(res.expr(), expr.full_expr()))
                             .unwrap_or(true)
-                }) {
-                    if face_hat!(face).remote_subs.values().any(|sub| {
-                        KeyExpr::try_from(sub.expr())
-                            .and_then(|subres| {
-                                KeyExpr::try_from(expr.full_expr())
-                                    .map(|putres| subres.intersects(&putres))
-                            })
-                            .unwrap_or(false)
-                    }) {
-                        let key_expr = Resource::get_best_key(expr.prefix, expr.suffix, face.id);
-                        route.insert(
-                            face.id,
-                            (face.clone(), key_expr.to_owned(), NodeId::default()),
-                        );
-                    }
-                } else {
+                }) || face_hat!(face)
+                    .remote_subs
+                    .values()
+                    .any(|sub| KeyExpr::keyexpr_intersect(sub.expr(), expr.full_expr()))
+                {
                     let key_expr = Resource::get_best_key(expr.prefix, expr.suffix, face.id);
                     route.insert(
                         face.id,

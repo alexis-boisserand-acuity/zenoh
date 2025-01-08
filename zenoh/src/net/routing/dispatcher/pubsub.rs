@@ -67,7 +67,7 @@ pub(crate) fn declare_subscription(
                     let wtables = zwrite!(tables.tables);
                     (res.unwrap(), wtables)
                 } else {
-                    let mut fullexpr = prefix.expr();
+                    let mut fullexpr = prefix.expr().to_string();
                     fullexpr.push_str(expr.suffix.as_ref());
                     let mut matches = keyexpr::new(fullexpr.as_str())
                         .map(|ke| Resource::get_matches(&rtables, ke))
@@ -434,9 +434,9 @@ pub fn route_data(
                             drop(tables);
                             #[cfg(feature = "stats")]
                             if !admin {
-                                inc_stats!(face, tx, user, msg.payload)
+                                inc_stats!(outface, tx, user, msg.payload)
                             } else {
-                                inc_stats!(face, tx, admin, msg.payload)
+                                inc_stats!(outface, tx, admin, msg.payload)
                             }
 
                             outface.primitives.send_push(
@@ -465,9 +465,9 @@ pub fn route_data(
                         for (outface, key_expr, context) in route {
                             #[cfg(feature = "stats")]
                             if !admin {
-                                inc_stats!(face, tx, user, msg.payload)
+                                inc_stats!(outface, tx, user, msg.payload)
                             } else {
-                                inc_stats!(face, tx, admin, msg.payload)
+                                inc_stats!(outface, tx, admin, msg.payload)
                             }
 
                             outface.primitives.send_push(

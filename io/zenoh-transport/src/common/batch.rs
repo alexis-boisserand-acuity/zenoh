@@ -201,6 +201,9 @@ pub struct WBatch {
     // Statistics related to this batch
     #[cfg(feature = "stats")]
     pub stats: WBatchStats,
+    // an ephemeral batch will not be recycled in the pipeline
+    // it can be used to push a stop fragment when no batch are available
+    pub ephemeral: bool,
 }
 
 impl WBatch {
@@ -209,6 +212,7 @@ impl WBatch {
             buffer: BBuf::with_capacity(config.mtu as usize),
             codec: Zenoh080Batch::new(),
             config,
+            ephemeral: false,
             #[cfg(feature = "stats")]
             stats: WBatchStats::default(),
         };
@@ -217,6 +221,17 @@ impl WBatch {
         batch.clear();
 
         batch
+    }
+
+    pub fn new_ephemeral(config: BatchConfig) -> Self {
+        Self {
+            ephemeral: true,
+            ..Self::new(config)
+        }
+    }
+
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
     }
 
     /// Verify that the [`WBatch`] has no serialized bytes.
@@ -348,7 +363,14 @@ impl Encode<&TransportMessage> for &mut WBatch {
 
     fn encode(self, x: &TransportMessage) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let res = self.codec.write(&mut writer, x);
+        #[cfg(feature = "stats")]
+        {
+            if res.is_ok() {
+                self.stats.t_msgs += 1;
+            }
+        }
+        res
     }
 }
 
@@ -366,7 +388,14 @@ impl Encode<(&NetworkMessage, &FrameHeader)> for &mut WBatch {
 
     fn encode(self, x: (&NetworkMessage, &FrameHeader)) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let res = self.codec.write(&mut writer, x);
+        #[cfg(feature = "stats")]
+        {
+            if res.is_ok() {
+                self.stats.t_msgs += 1;
+            }
+        }
+        res
     }
 }
 
@@ -375,7 +404,14 @@ impl Encode<(&mut ZBufReader<'_>, &mut FragmentHeader)> for &mut WBatch {
 
     fn encode(self, x: (&mut ZBufReader<'_>, &mut FragmentHeader)) -> Self::Output {
         let mut writer = self.buffer.writer();
-        self.codec.write(&mut writer, x)
+        let res = self.codec.write(&mut writer, x);
+        #[cfg(feature = "stats")]
+        {
+            if res.is_ok() {
+                self.stats.t_msgs += 1;
+            }
+        }
+        res
     }
 }
 

@@ -195,7 +195,8 @@ impl TransportUnicastUniversal {
         };
 
         // Notify the callback
-        if let Some(callback) = zread!(self.callback).as_ref() {
+        let cb = zread!(self.callback).clone();
+        if let Some(callback) = cb {
             callback.del_link(link);
         }
 
@@ -398,10 +399,7 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
     /*                TX                 */
     /*************************************/
     fn schedule(&self, msg: NetworkMessage) -> ZResult<()> {
-        match self.internal_schedule(msg) {
-            true => Ok(()),
-            false => bail!("error scheduling message!"),
-        }
+        self.internal_schedule(msg).map(|_| ())
     }
 
     fn add_debug_fields<'a, 'b: 'a, 'c>(
